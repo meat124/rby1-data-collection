@@ -1,0 +1,73 @@
+import numpy as np
+from dataclasses import dataclass
+from typing import Union, Optional, Any
+import threading
+import os
+import yaml
+import rby1_sdk as rby
+from vr_control_state import VRControlState
+
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.yaml')
+try:
+    with open(_CONFIG_PATH, encoding='utf-8') as _f:
+        _config = yaml.safe_load(_f) or {}
+except Exception:
+    _config = {}
+
+class Settings:
+    dt: float = 0.1
+    hand_offset: float = np.array([0.0, 0.0, 0.0])
+
+    T_hand_offset = np.identity(4)
+    T_hand_offset[0:3, 3] = hand_offset
+
+    vr_control_local_port: int = 5005
+    vr_control_meta_quest_port: int = 6000
+
+    mobile_linear_acceleration_gain: float = -0.15
+    mobile_angular_acceleration_gain: float = 0.15
+    mobile_linear_damping_gain: float = 0.3
+    mobile_angular_damping_gain: float = 0.3
+
+    rec_fps: int = _config.get('rec_fps', 15)
+
+    MAX_POINT: int = None
+
+    # Initial poses in degrees
+    torso_init_pose: tuple = (0.0, 20.0, -40.0, 35.0, 0.0, 0.0)  #0 20 -40 20 0 0 -> 0 20 -40 40 0 0
+    right_arm_init_pose: tuple = (-24.0, -60.0, 10.0, -120.0, -60.0, 85.0, 0.0)  #0 -15 0 -120 0 70 0 -> -24 -20 10 -120 -20 85 0
+    left_arm_init_pose: tuple = (-24.0, 60.0, -10.0, -120.0, 60.0, 85.0, 0.0)    #0 15 0 -120 0 70 0 -> -24 20 -10 -120 20 85 0
+    torso_head_init_pose: tuple = (0.0, 0.0)
+    bimanual_head_init_pose: tuple = (0.0, 40.0)
+    
+    shoulder_pitch_angle: float = 70.0
+    shoulder_roll_angle: float = 30.0
+    elbow_angle: float = -100.0
+    wrist_angle: float = -70.0
+
+    right_arm_midpoint1 = np.deg2rad([shoulder_pitch_angle, -shoulder_roll_angle, 0.0, elbow_angle, 0.0, wrist_angle, 0.0])
+    left_arm_midpoint1 = np.deg2rad([shoulder_pitch_angle, shoulder_roll_angle, 0.0, elbow_angle, 0.0, wrist_angle, 0.0])
+
+    right_arm_midpoint2 = np.deg2rad([0.0, -15.0, 0.0, elbow_angle, 0.0, wrist_angle, 0.0])
+    left_arm_midpoint2 = np.deg2rad([0.0, 15.0, 0.0, elbow_angle, 0.0, wrist_angle, 0.0])
+
+    body_init_pose: float = np.deg2rad(torso_init_pose + right_arm_init_pose + left_arm_init_pose)
+
+class SystemContext:
+    robot_model: Union[rby.Model_A, rby.Model_M] = None
+    vr_state: VRControlState = VRControlState()
+    # H5 writer and recording stop-event stored here so other threads/handlers can access them
+    h5_writer: Optional[Any] = None
+    rec_stop_event: Optional[threading.Event] = None
+    cleanup_functions: list = []  # Functions to call on cleanup
+    
+    # Camera object for stopping frames when recording stops
+    realsense: Optional[object] = None
+    camera_warmup_done: bool = False
+    
+    # Lock for thread-safe recording state transitions
+    # (protects demo_recording_status and start_new_recording_requested shared between main loop and VR button handler)
+    recording_lock: threading.Lock = threading.Lock()
+    # Demo recording state management
+    demo_recording_status: str = "idle"  # "idle", "recording", "stopping"
+    start_new_recording_requested: bool = False  # Flag to request starting a new recording in main loop

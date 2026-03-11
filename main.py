@@ -1,0 +1,866 @@
+import argparse
+import logging
+import zmq
+import time
+import threading
+import rby1_sdk as rby
+import numpy as np
+from scipy.spatial.transform import Rotation as R, Slerp
+from remote_gripper import Gripper
+import pickle
+import yaml
+import os
+
+# demo writer
+from h5_writer import H5Writer
+from pcd_utils import rgbd_to_pointcloud, REALSENSE_D435_INTRINSICS, REALSENSE_D435_INTRINSICS_848x480
+
+from utils import *
+from helper import *
+
+from camera import MultiRealsense
+from setup import Settings, SystemContext
+from robot_communicate import connect_rby1
+from vr_communicate import setup_meta_quest_udp_communication, handle_vr_button_event
+
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)-8s - %(message)s"
+)
+
+T_conv = np.array([
+    [0, -1, 0, 0],
+    [0, 0, 1, 0],
+    [1, 0, 0, 0],
+    [0, 0, 0, 1],
+])
+
+def open_zmq_pub_socket(bind_address: str) -> zmq.Socket:
+    context = zmq.Context()
+    socket = context.socket(zmq.PUB)
+    socket.bind(bind_address)
+    logging.info(f"ZMQ PUB server opened at {bind_address}")
+    return socket
+
+def pose_to_se3(position, rotation_quat):
+    T = np.eye(4)
+    T[:3, :3] = R.from_quat(rotation_quat).as_matrix()
+    T[:3, 3] = position
+    return T
+
+
+def publish_gv(sock: zmq.Socket):
+    while True:
+        try:
+            sock.send(pickle.dumps(SystemContext.vr_state))
+        except Exception as e:
+            logging.warning(f"[publish_gv] Failed to publish state: {e}")
+        time.sleep(0.1)
+
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.yaml')
+
+def get_config():
+    with open(_CONFIG_PATH, encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+        return config
+
+# NOTE
+def start_demo_logger(gripper: Gripper | None, h5_writer, robot, fps: int = 30) -> threading.Event:
+    """
+    Starts a daemon thread that prints a dict with:
+      - robot_state.position
+      - gripper.get_state()
+    at ~fps Hz (default 30). Returns a stop_event you can set() to stop it.
+    """
+    print("start demo logger on\n")
+    period = 1.0 / float(fps)
+    stop_event = threading.Event()
+
+    # Get robot dynamics for IK computation
+    dyn_robot = robot.get_dynamics()
+    robot_model = robot.model()
+
+    config = get_config()
+    # Get camera configuration from the config file
+    cameras_config = config.get('cameras', {})
+    if cameras_config is None:
+        cameras_config = {}
+    if not cameras_config:
+        logging.warning("No camera configuration found in config.yaml. Camera streams will not be processed.")
+    
+    cam_names = list(cameras_config.keys())
+    cam_name_to_serial = {cam_name: spec['serial'] for cam_name, spec in cameras_config.items()}
+    camera_serials = [cam_name_to_serial[cam_name] for cam_name in cam_names]
+    serial_to_cam_name = {v: k for k, v in cam_name_to_serial.items()}
+    expected_serials = set(camera_serials)
+    primary_serial = camera_serials[0] if camera_serials else None
+    img_size = config.get('img_size', {'width': 640, 'height': 480})
+    camera_warmup_secs = float(config.get('camera_warmup_secs', 2.0))
+    camera_warmup_frames = int(config.get('camera_warmup_frames', max(15, int(fps))))
+
+    realsense_obj = SystemContext.realsense
+    realsense = realsense_obj if isinstance(realsense_obj, MultiRealsense) else None
+    if realsense is None or not getattr(realsense, "running", False):
+        realsense = MultiRealsense(camera_serials=camera_serials, width=img_size['width'], height=img_size['height'])
+        realsense.start()
+
+        # Store realsense object in SystemContext for access from other threads
+        SystemContext.realsense = realsense
+        # Warm-up should run once per camera stream lifecycle.
+        SystemContext.camera_warmup_done = False
+        logging.info("Started RealSense streams (warm-up will run once).")
+    else:
+        logging.info("Reusing existing RealSense streams (warm-up already done).")
+
+    def _loop():
+        logging.info("loop started")
+        next_t = time.perf_counter()
+        record_start_t = time.perf_counter()
+        last_logged_primary_ts = None
+        last_camera_wait_warn_t = 0.0
+        last_warmup_warn_t = 0.0
+        warmup_unique_frames = 0
+        last_warmup_primary_ts = None
+
+        while not stop_event.is_set():
+            # Thread-safe snapshot of latest camera frames (optional)
+            frames = realsense.get_frames()
+
+            if not frames:
+                frames = {}
+
+            # Use the first camera in cam_ids for primary tasks like PCD generation (if available).
+            primary_cam_id = None
+            primary_cam_data = None
+            frame = None
+            depth = None
+            frame_stamp = None
+
+            if frames and primary_serial is not None and primary_serial in frames:
+                try:
+                    primary_cam_id = primary_serial
+                    primary_cam_data = frames[primary_cam_id]
+                    frame = primary_cam_data.color
+                    depth = primary_cam_data.depth
+                    frame_stamp = primary_cam_data.t
+                except Exception as e:
+                    logging.warning(f"[demo_logger] Failed to get primary camera data: {e}")
+                    frame = None
+                    depth = None
+                    frame_stamp = None
+
+            # Strict synchronization rule for dataset recording:
+            # record only when every configured camera exists and primary frame timestamp is fresh.
+            data_collection_bool = args.data_collect
+            if data_collection_bool and expected_serials:
+                missing_serials = expected_serials - set(frames.keys())
+                if missing_serials:
+                    now_t = time.perf_counter()
+                    if now_t - last_camera_wait_warn_t > 1.0:
+                        missing_names = [serial_to_cam_name.get(s, s) for s in sorted(missing_serials)]
+                        logging.warning(
+                            f"[demo_logger] Missing synced frames from cameras={missing_names}. "
+                            "Skip this timestep to keep robot/image counts aligned."
+                        )
+                        last_camera_wait_warn_t = now_t
+
+                    next_t += period
+                    sleep_for = next_t - time.perf_counter()
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
+                    else:
+                        next_t = time.perf_counter()
+                    continue
+
+                if frame_stamp is None:
+                    next_t += period
+                    sleep_for = next_t - time.perf_counter()
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
+                    else:
+                        next_t = time.perf_counter()
+                    continue
+
+                if last_logged_primary_ts is not None and frame_stamp <= (last_logged_primary_ts + 1e-6):
+                    # No new camera frame yet; skip to avoid duplicated image samples.
+                    next_t += period
+                    sleep_for = next_t - time.perf_counter()
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
+                    else:
+                        next_t = time.perf_counter()
+                    continue
+
+                # Camera warm-up gate (process-level one-time):
+                # drop initial frames while auto-exposure/auto-white-balance converges.
+                if not SystemContext.camera_warmup_done:
+                    if frame_stamp is not None and (
+                        last_warmup_primary_ts is None or frame_stamp > (last_warmup_primary_ts + 1e-6)
+                    ):
+                        warmup_unique_frames += 1
+                        last_warmup_primary_ts = frame_stamp
+
+                    elapsed = time.perf_counter() - record_start_t
+                    warmup_done = (
+                        (elapsed >= camera_warmup_secs)
+                        and (warmup_unique_frames >= camera_warmup_frames)
+                    )
+
+                    if not warmup_done:
+                        now_t = time.perf_counter()
+                        if now_t - last_warmup_warn_t > 1.0:
+                            logging.info(
+                                "[demo_logger] Camera warm-up in progress "
+                                f"(elapsed={elapsed:.2f}s/{camera_warmup_secs:.2f}s, "
+                                f"frames={warmup_unique_frames}/{camera_warmup_frames}). "
+                                "Skip initial unstable frames."
+                            )
+                            last_warmup_warn_t = now_t
+
+                        next_t += period
+                        sleep_for = next_t - time.perf_counter()
+                        if sleep_for > 0:
+                            time.sleep(sleep_for)
+                        else:
+                            next_t = time.perf_counter()
+                        continue
+
+                    SystemContext.camera_warmup_done = True
+                    logging.info("[demo_logger] Camera warm-up completed (process-level one-time).")
+
+            # Robot joint positions - 현재 포지션 읽기
+            robot_pos = None
+
+            try:
+                if SystemContext.vr_state.joint_positions is not None:
+                    # robot_pos = np.array(SystemContext.robot_state.position, dtype=float)
+                # elif SystemContext.vr_state.joint_positions.size > 0:
+                    # fallback to the latest joints cached in vr_state
+                    robot_pos = np.array(SystemContext.vr_state.joint_positions, dtype=float)
+            except Exception as e:
+                logging.warning(f"[demo_logger] Failed to read robot position: {e}")
+            
+            # Skip this step if robot position is unavailable
+            if robot_pos is None:
+                next_t += period
+                sleep_for = next_t - time.perf_counter()
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+                else:
+                    next_t = time.perf_counter()
+                continue
+
+            # robot_target_joints initially equals current position;
+            # update_previous_target() will overwrite step t-1 with robot_pos[t] on the next iteration.
+            robot_target_joints = robot_pos.copy()
+
+            # Gripper encoders (actual measured state)
+            grip = None
+            try:
+                if gripper is not None and hasattr(gripper, "get_state"):
+                    grip = gripper.get_state()  # expected to return np.ndarray or None
+            except Exception as e:
+                logging.warning(f"[demo_logger] Failed to read gripper state: {e}")
+
+            # base velocity
+            base_state = None
+            try:
+                if SystemContext.vr_state.mobile_linear_velocity is not None:
+                    linear_vel = np.array(SystemContext.vr_state.mobile_linear_velocity, dtype=float)
+                    linear_vel = np.squeeze(linear_vel)
+                    angular_vel = np.array(SystemContext.vr_state.mobile_angular_velocity, dtype=float)
+                    base_state = np.concatenate((linear_vel, [angular_vel]), axis=0)
+            except Exception as e:
+                logging.warning(f"[demo_logger] Failed to read base velocity: {e}")
+
+            '''
+            x 버튼 한번 누르면 데이터 수집 시작
+            x 버튼 한번 더 누르면 데이터 수집 종료 및 저장
+            x 버튼 다시 누르면 새로운 데모 수집
+            '''
+
+            # logging.info(f"data_collection_bool activated: {data_collection_bool}")
+
+            if data_collection_bool:
+                # Generate PCD from RGB-D
+                pcd_points = None
+                pcd_colors = None
+                if frame is not None and depth is not None:
+                    try:
+                        rgb_frame = frame
+                        depth_frame = depth
+                        print("camera time stamp : ", frame_stamp)
+                        
+                        # Determine intrinsics based on depth image size
+                        H_d, W_d = depth_frame.shape
+                        if W_d == 848 and H_d == 480:                      
+                            intrinsics = REALSENSE_D435_INTRINSICS_848x480
+                        else:
+                            intrinsics = REALSENSE_D435_INTRINSICS
+                        
+                        # Resize RGB to match depth if needed
+                        if rgb_frame.shape[:2] != depth_frame.shape:
+                            try:
+                                import cv2
+                                rgb_frame = cv2.resize(rgb_frame, (depth_frame.shape[1], depth_frame.shape[0]))
+                            except ImportError:
+                                logging.warning("[demo_logger] cv2 not available for RGB resize")
+                        depth_frame_for_pcd = np.where(depth_frame > 3000, 0, depth_frame)  
+                        # Convert to point cloud (all points, no downsampling)
+                        pcd_points, pcd_colors = rgbd_to_pointcloud(
+                            rgb_frame, depth_frame_for_pcd,
+                            intrinsics['fx'], intrinsics['fy'],
+                            intrinsics['cx'], intrinsics['cy'],
+                            max_points=Settings.MAX_POINT
+                        )
+                        
+                        # Debug: check if PCD was generated
+                        if pcd_points is not None and len(pcd_points) > 0:
+                            print(f"[demo_logger] Generated PCD: {len(pcd_points)} points")
+                        else:
+                            print(f"[demo_logger] WARNING: PCD generation returned empty result")
+                    except Exception as e:
+                        logging.warning(f"[demo_logger] Failed to generate PCD: {e}")
+                
+                
+                # Align global sample timestamp to camera timestamp
+                sample_ts = float(frame_stamp) if frame_stamp is not None else time.time()
+
+                # Update previous step's target only when we are actually committing a sample.
+                h5_writer.update_previous_target(robot_pos)
+
+                print("demo saved\n")
+                # print("robot_pose shape: ", robot_pos.shape)
+                # print("robot_target_joints shape: ", robot_target_joints.shape)
+                # print("gripper_state shape: ", grip.shape if grip is not None else None)
+                # print("base_state shape: ", base_state.shape if base_state is not None else None)
+                # print("head_rgb shape: ", headcam_sub.curr_frame.shape if headcam_sub.curr_frame is not None else None)
+                
+
+                # Create a dynamic dictionary to hold data for all cameras
+                data_to_save = {
+                    "ts": sample_ts,
+                    "robot_position": robot_pos,
+                    "robot_target_joints": robot_target_joints,
+                    "gripper_state": grip,
+                    "gripper_target": gripper.get_target().copy() if gripper else None,
+                    "base_state" : base_state,
+                    "pcd_points": pcd_points,
+                    "pcd_colors": pcd_colors
+                }
+
+                # Iterate through all available cameras and add their data to the dictionary
+                for cam_name in cam_names:
+                    cam_id = cam_name_to_serial[cam_name]
+                    if cam_id not in frames:
+                        # Should not happen due strict check above, but keep safe.
+                        continue
+                    logging.info(f"{cam_name} image is saving")
+                    cam_data = frames[cam_id]
+                    data_to_save[f"{cam_name}_rgb"] = cam_data.color
+                    data_to_save[f"{cam_name}_rgb_ts"] = cam_data.t
+                    if cam_data.depth is not None:
+                        data_to_save[f"{cam_name}_depth"] = cam_data.depth
+                        data_to_save[f"{cam_name}_depth_ts"] = cam_data.t
+                    # logging.info(f"{cam_data} color frame is {cam_data.color}")
+                h5_writer.put(data_to_save)
+                if frame_stamp is not None:
+                    last_logged_primary_ts = frame_stamp
+
+            # pacing at ~30 FPS with drift correction
+            next_t += period
+            sleep_for = next_t - time.perf_counter()
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            else:
+                # we overran; reset schedule to now to avoid accumulating lag
+                next_t = time.perf_counter()
+
+    t = threading.Thread(target=_loop, name="demo_logger", daemon=True)
+    t.start()
+    logging.info(f"Started demo logger at {fps} FPS")
+
+    # This is a bit of a hack. The _loop will run until the main thread exits.
+    # We return a stop_event that can be used to signal the loop to stop.
+    # Camera stop is handled at process shutdown, so streams can be reused across demos.
+    def cleanup():
+        stop_event.set()
+
+    SystemContext.cleanup_functions.append(cleanup)
+    
+    return stop_event
+
+def main(args: argparse.Namespace):
+    logging.info("=== VR Control System Starting ===")
+    logging.info(f"Server Address       : {args.server}")
+    logging.info(f"Local (UPC) IP       : {args.local_ip}:{Settings.vr_control_local_port}")
+    logging.info(f"Meta Quest IP        : {args.meta_quest_ip}:{Settings.vr_control_meta_quest_port}")
+    logging.info(f"Use Gripper          : {'No' if args.no_gripper else 'Yes'}")
+    logging.info(f"RB-Y1 gRPC Address   : {args.rby1}")
+    logging.info(f"RB-Y1 Model          : {args.rby1_model}")
+    logging.info(f"Use Head             : {'No' if args.no_head else 'Yes'}")
+    logging.info(f"Data Collection      : {args.data_collect}")
+
+    config = get_config() 
+    root_path = os.path.join(config['demo_root'], config['task_name'])
+    os.makedirs(root_path, exist_ok=True)
+
+    # start writing
+    # H5 file will be created only when X button is pressed
+    output_path = None
+    h5_writer = None
+    if args.data_collect:
+        logging.info("Data collection mode enabled - H5 file will be created when X button is pressed")
+
+    def power_off_and_stop():
+        if args.data_collect and rec_data is not None:
+            rec_data.set()  # stop signal for logging thread
+        if h5_writer is not None:
+            h5_writer.stop()  # save h5 file and exit
+        if isinstance(SystemContext.realsense, MultiRealsense):
+            try:
+                SystemContext.realsense.stop()
+            except Exception as e:
+                logging.warning(f"Failed to stop camera during shutdown: {e}")
+        robot.power_off(".*")
+        for cleanup_func in SystemContext.cleanup_functions:
+            cleanup_func()
+
+
+    socket = open_zmq_pub_socket(args.server)
+    robot = connect_rby1(args.rby1, args.rby1_model, args.no_head)
+    model = robot.model()
+    setup_meta_quest_udp_communication(
+        args.local_ip, 
+        Settings.vr_control_local_port, 
+        args.meta_quest_ip,
+        Settings.vr_control_meta_quest_port, 
+        power_off_and_stop,
+    )
+
+    gripper = None
+    if not args.no_gripper:
+        for arm in ["left", "right"]:
+            if not robot.set_tool_flange_output_voltage(arm, 12):
+                logging.error(f"Failed to supply 12V to tool flange. ({arm})")
+        time.sleep(0.5)
+        gripper = Gripper()
+        if not gripper.initialize(verbose=True):
+            exit(1)
+        gripper.homing()
+        gripper.start()
+        gripper.set_normalized_target(np.array([1.0, 1.0]))
+
+    pub_thread = threading.Thread(target=publish_gv, args=(socket,), daemon=True)
+    pub_thread.start()
+
+    rec_data = None
+
+    # Initialize cleanup functions container before starting subsystems
+    SystemContext.cleanup_functions = []
+
+    # Only start recording when X button is pressed, not at startup
+    if args.data_collect:
+        logging.info("Data collection mode enabled - recording will start when X button is pressed")
+        SystemContext.demo_recording_status = "idle"
+    else:
+        SystemContext.demo_recording_status = "idle"
+
+
+    # expose writer and stop-event so button handlers can stop and save
+    SystemContext.h5_writer = h5_writer
+    SystemContext.rec_stop_event = rec_data
+
+
+    logging.info(f"output path is {output_path}\n h5 is {h5_writer}\n")
+
+    dyn_robot = robot.get_dynamics()
+    dyn_state = dyn_robot.make_state(["base", "link_torso_5", "link_right_arm_6", "link_left_arm_6"],
+                                     SystemContext.robot_model.robot_joint_names)
+    base_link_idx, link_torso_5_idx, link_right_arm_6_idx, link_left_arm_6_idx = 0, 1, 2, 3
+
+    next_time = time.monotonic()
+    stream = None
+    torso_reset = False
+    right_reset = False
+    left_reset = False
+
+    logging.info("Entering main control loop")
+
+    while True:
+        now = time.monotonic()
+        if now < next_time:
+            time.sleep(next_time - now)
+        next_time += Settings.dt
+
+        if SystemContext.vr_state.joint_positions.size == 0:
+            continue
+        button_event, torso_mode = handle_vr_button_event(robot, args.no_head)
+
+        # Handle new recording request (lock for thread-safe read-and-clear)
+        with SystemContext.recording_lock:
+            _new_recording = SystemContext.start_new_recording_requested
+            if _new_recording:
+                SystemContext.start_new_recording_requested = False
+
+        if _new_recording:
+            logging.info("Handling new recording request")
+
+            # Create new H5 file path and writer
+            output_path = get_next_h5_path(root_path)
+            h5_writer = H5Writer(path=output_path, flush_every=60, flush_secs=1.0).start()
+
+            # Start new demo logger
+            rec_data = start_demo_logger(gripper, h5_writer, robot, fps=Settings.rec_fps)
+
+            # Update SystemContext under lock so button handler sees consistent state
+            with SystemContext.recording_lock:
+                SystemContext.h5_writer = h5_writer
+                SystemContext.rec_stop_event = rec_data
+
+            logging.info(f"New recording started: {output_path}")
+        
+        if button_event:
+            if stream is not None:
+                stream.cancel()
+                stream = None
+
+        if not SystemContext.vr_state.is_initialized:
+            continue
+
+        if SystemContext.vr_state.is_stopped:
+            if stream is not None:
+                stream.cancel()
+                stream = None
+            SystemContext.vr_state.is_initialized = False
+            continue
+
+        # Gripper: update cached target and send (avoid remote get_normalized_target() RPC every tick)
+        if "hands" in SystemContext.vr_state.controller_state:
+            if "right" in SystemContext.vr_state.controller_state["hands"]:
+                right_controller = SystemContext.vr_state.controller_state["hands"]["right"]
+                if gripper is not None:
+                    gripper_target = gripper.get_target()
+                    gripper_target[0] = 1. -right_controller["buttons"]["trigger"]
+                    gripper.set_normalized_target(gripper_target)
+
+            if "left" in SystemContext.vr_state.controller_state["hands"]:
+                left_controller = SystemContext.vr_state.controller_state["hands"]["left"]
+                if gripper is not None:
+                    gripper_target = gripper.get_target()
+                    gripper_target[1] = 1. - left_controller["buttons"]["trigger"]
+                    gripper.set_normalized_target(gripper_target)
+
+        # logging.info(f"{SystemContext.vr_state.center_of_mass = }")
+
+        dyn_state.set_q(SystemContext.vr_state.joint_positions.copy())
+        dyn_robot.compute_forward_kinematics(dyn_state)
+
+        SystemContext.vr_state.base_pose = dyn_robot.compute_transformation(dyn_state, base_link_idx, link_torso_5_idx)
+        SystemContext.vr_state.torso_current_pose = dyn_robot.compute_transformation(dyn_state, base_link_idx,
+                                                                                     link_torso_5_idx)
+        SystemContext.vr_state.right_ee_current_pose = dyn_robot.compute_transformation(dyn_state, base_link_idx,
+                                                                                        link_right_arm_6_idx) @ Settings.T_hand_offset
+        SystemContext.vr_state.left_ee_current_pose = dyn_robot.compute_transformation(dyn_state, base_link_idx,
+                                                                                       link_left_arm_6_idx) @ Settings.T_hand_offset
+
+        trans_12 = dyn_robot.compute_transformation(dyn_state, 1, 2)
+        trans_13 = dyn_robot.compute_transformation(dyn_state, 1, 3)
+        center = (trans_12[:3, 3] + trans_13[:3, 3]) / 2
+        yaw = np.arctan2(center[1], center[0])
+        pitch = np.arctan2(-center[2], center[0]) - np.deg2rad(10)
+        yaw = np.clip(yaw, -np.deg2rad(29), np.deg2rad(29))
+        pitch = np.clip(pitch, -np.deg2rad(19), np.deg2rad(89))
+
+        # Tracking
+        if stream is None:
+            if robot.wait_for_control_ready(0):
+                stream = robot.create_command_stream()
+                SystemContext.vr_state.mobile_linear_velocity = np.array([0.0, 0.0])
+                SystemContext.vr_state.mobile_angular_velocity = 0.
+                SystemContext.vr_state.is_right_following = False
+                SystemContext.vr_state.is_left_following = False
+                SystemContext.vr_state.base_start_pose = SystemContext.vr_state.base_pose
+                SystemContext.vr_state.torso_locked_pose = SystemContext.vr_state.torso_current_pose
+                SystemContext.vr_state.right_hand_locked_pose = SystemContext.vr_state.right_ee_current_pose
+                SystemContext.vr_state.left_hand_locked_pose = SystemContext.vr_state.left_ee_current_pose
+
+        if "hands" in SystemContext.vr_state.controller_state:
+            if "right" in SystemContext.vr_state.controller_state["hands"]:
+                right_controller = SystemContext.vr_state.controller_state["hands"]["right"]
+                thumbstick_axis = right_controller["buttons"]["thumbstickAxis"]
+                acc = np.array([thumbstick_axis[1], thumbstick_axis[0]])
+                SystemContext.vr_state.mobile_linear_velocity += Settings.mobile_linear_acceleration_gain * acc
+                # SystemContext.vr_state.mobile_angular_velocity += Settings.mobile_angular_acceleration_gain * \
+                #                                                   thumbstick_axis[0]
+                SystemContext.vr_state.right_controller_current_pose = T_conv.T @ pose_to_se3(
+                    right_controller["position"],
+                    right_controller["rotation"]) @ T_conv
+
+                trigger_pressed = right_controller["buttons"]["grip"] > 0.8
+                if SystemContext.vr_state.is_right_following and not trigger_pressed:
+                    SystemContext.vr_state.is_right_following = False
+                if not SystemContext.vr_state.is_right_following and trigger_pressed:
+                    SystemContext.vr_state.right_controller_start_pose = SystemContext.vr_state.right_controller_current_pose
+                    SystemContext.vr_state.right_ee_start_pose = SystemContext.vr_state.right_ee_current_pose
+                    SystemContext.vr_state.is_right_following = True
+                    right_reset = True
+            else:
+                SystemContext.vr_state.is_right_following = False
+
+            if "left" in SystemContext.vr_state.controller_state["hands"]:
+                left_controller = SystemContext.vr_state.controller_state["hands"]["left"]
+                thumbstick_axis = left_controller["buttons"]["thumbstickAxis"]
+                # SystemContext.vr_state.mobile_linear_velocity += Settings.mobile_linear_acceleration_gain * \
+                #                                                  thumbstick_axis[1]
+                SystemContext.vr_state.mobile_angular_velocity += Settings.mobile_angular_acceleration_gain * \
+                                                                  thumbstick_axis[0]
+                SystemContext.vr_state.left_controller_current_pose = T_conv.T @ pose_to_se3(
+                    left_controller["position"],
+                    left_controller["rotation"]) @ T_conv
+
+                trigger_pressed = left_controller["buttons"]["grip"] > 0.8
+                if SystemContext.vr_state.is_left_following and not trigger_pressed:
+                    SystemContext.vr_state.is_left_following = False
+                if not SystemContext.vr_state.is_left_following and trigger_pressed:
+                    SystemContext.vr_state.left_controller_start_pose = SystemContext.vr_state.left_controller_current_pose
+                    SystemContext.vr_state.left_ee_start_pose = SystemContext.vr_state.left_ee_current_pose
+                    SystemContext.vr_state.is_left_following = True
+                    left_reset = True
+            else:
+                SystemContext.vr_state.is_left_following = False
+
+            if "head" in SystemContext.vr_state.controller_state:
+                head_controller = SystemContext.vr_state.controller_state["head"]
+                SystemContext.vr_state.head_controller_current_pose = T_conv.T @ pose_to_se3(
+                    head_controller["position"],
+                    head_controller["rotation"]) @ T_conv
+
+                following = SystemContext.vr_state.is_right_following and SystemContext.vr_state.is_left_following and torso_mode
+                if SystemContext.vr_state.is_torso_following and not following:
+                    SystemContext.vr_state.is_torso_following = False
+                if not SystemContext.vr_state.is_torso_following and following:
+                    SystemContext.vr_state.head_controller_start_pose = SystemContext.vr_state.head_controller_current_pose
+                    SystemContext.vr_state.torso_start_pose = SystemContext.vr_state.torso_current_pose
+                    SystemContext.vr_state.is_torso_following = True
+                    torso_reset = True
+            else:
+                SystemContext.vr_state.is_torso_following = False
+
+        SystemContext.vr_state.mobile_linear_velocity -= Settings.mobile_linear_damping_gain * SystemContext.vr_state.mobile_linear_velocity
+        SystemContext.vr_state.mobile_angular_velocity -= Settings.mobile_angular_damping_gain * SystemContext.vr_state.mobile_angular_velocity
+
+        if stream:
+            try:
+                if SystemContext.vr_state.is_right_following:
+                    diff = np.linalg.inv(
+                        SystemContext.vr_state.right_controller_start_pose) @ SystemContext.vr_state.right_controller_current_pose
+
+                    T_global2start = np.identity(4)
+                    T_global2start[:3, :3] = R.from_euler('y', 90, degrees=True).as_matrix()
+                    diff_global = T_global2start @ diff @ T_global2start.T
+
+                    T = np.identity(4)
+                    T[:3, :3] = SystemContext.vr_state.right_ee_start_pose[:3, :3]
+                    right_T = SystemContext.vr_state.right_ee_start_pose @ diff_global
+                    SystemContext.vr_state.right_hand_locked_pose = right_T
+                else:
+                    right_T = SystemContext.vr_state.right_hand_locked_pose
+
+                if SystemContext.vr_state.is_left_following:
+                    diff = np.linalg.inv(
+                        SystemContext.vr_state.left_controller_start_pose) @ SystemContext.vr_state.left_controller_current_pose
+
+                    T_global2start = np.identity(4)
+                    T_global2start[:3, :3] = R.from_euler('y', 90, degrees=True).as_matrix()
+                    diff_global = T_global2start @ diff @ T_global2start.T
+
+                    T = np.identity(4)
+                    T[:3, :3] = SystemContext.vr_state.left_ee_start_pose[:3, :3]
+                    left_T = SystemContext.vr_state.left_ee_start_pose @ diff_global
+                    SystemContext.vr_state.left_hand_locked_pose = left_T
+                else:
+                    left_T = SystemContext.vr_state.left_hand_locked_pose
+
+                if SystemContext.vr_state.is_torso_following and torso_mode:
+                    print('a')
+                    diff = np.linalg.inv(
+                        SystemContext.vr_state.head_controller_start_pose) @ SystemContext.vr_state.head_controller_current_pose
+
+                    T = np.identity(4)
+                    T[:3, :3] = SystemContext.vr_state.torso_start_pose[:3, :3]
+                    torso_T = SystemContext.vr_state.torso_start_pose @ diff
+                    SystemContext.vr_state.torso_locked_pose = torso_T
+                else:
+                    torso_T = SystemContext.vr_state.torso_locked_pose
+
+                if args.whole_body:
+                    ctrl_builder = (
+                        rby.CartesianImpedanceControlCommandBuilder()
+                        .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
+                        .set_minimum_time(Settings.dt * 1.01)
+                        .set_joint_stiffness([400.] * 6 + [60] * 7 + [60] * 7)
+                        .set_joint_torque_limit([500] * 6 + [30] * 7 + [30] * 7)
+                        .add_joint_limit("right_arm_3", -2.6, -0.5)
+                        .add_joint_limit("right_arm_5", 0.2, 1.9)
+                        .add_joint_limit("left_arm_3", -2.6, -0.5)
+                        .add_joint_limit("left_arm_5", 0.2, 1.9)
+                        .add_joint_limit("torso_1", -0.523598776, 1.3)
+                        .add_joint_limit("torso_2", -2.617993878, -0.2)
+                        .set_stop_joint_position_tracking_error(0)
+                        .set_stop_orientation_tracking_error(0)
+                        .set_stop_joint_position_tracking_error(0)
+                        .set_reset_reference(right_reset | left_reset | torso_reset)
+                    )
+                    ctrl_builder.add_target("base", "link_torso_5", torso_T, 1, np.pi * 0.5, 10, np.pi * 20)
+                    ctrl_builder.add_target("base", "link_right_arm_6", right_T @ np.linalg.inv(Settings.T_hand_offset),
+                                            2, np.pi * 2, 20, np.pi * 80)
+                    ctrl_builder.add_target("base", "link_left_arm_6", left_T @ np.linalg.inv(Settings.T_hand_offset),
+                                            2, np.pi * 2, 20, np.pi * 80)
+
+                else:
+                    torso_builder = (
+                        rby.CartesianImpedanceControlCommandBuilder()
+                        .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
+                        .set_minimum_time(Settings.dt * 1.01)
+                        .set_joint_stiffness([400.] * 6)
+                        .set_joint_torque_limit([500] * 6)
+                        .add_joint_limit("torso_1", -0.523598776, 1.3)
+                        .add_joint_limit("torso_2", -2.617993878, -0.2)
+                        .set_stop_joint_position_tracking_error(0)
+                        .set_stop_orientation_tracking_error(0)
+                        .set_stop_joint_position_tracking_error(0)
+                        .set_reset_reference(torso_reset)
+                    )
+                    right_builder = (
+                        rby.CartesianImpedanceControlCommandBuilder()
+                        .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
+                        .set_minimum_time(Settings.dt * 1.01)
+                        .set_joint_stiffness([80, 80, 80, 80, 80, 80, 40])
+                        .set_joint_torque_limit([30] * 7)
+                        .add_joint_limit("right_arm_3", -2.6, -0.5)
+                        .add_joint_limit("right_arm_5", 0.2, 1.9)
+                        .set_stop_joint_position_tracking_error(0)
+                        .set_stop_orientation_tracking_error(0)
+                        .set_stop_joint_position_tracking_error(0)
+                        .set_reset_reference(right_reset)
+                    )
+                    left_builder = (
+                        rby.CartesianImpedanceControlCommandBuilder()
+                        .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
+                        .set_minimum_time(Settings.dt * 1.01)
+                        .set_joint_stiffness([80, 80, 80, 80, 80, 80, 40])
+                        .set_joint_torque_limit([30] * 7)
+                        .add_joint_limit("left_arm_3", -2.6, -0.5)
+                        .add_joint_limit("left_arm_5", 0.2, 1.9)
+                        .set_stop_joint_position_tracking_error(0)
+                        .set_stop_orientation_tracking_error(0)
+                        .set_stop_joint_position_tracking_error(0)
+                        .set_reset_reference(left_reset)
+                    )
+                    torso_builder.add_target("base", "link_torso_5", torso_T, 1, np.pi * 0.5, 10, np.pi * 20)
+                    right_builder.add_target("base", "link_right_arm_6",
+                                             right_T @ np.linalg.inv(Settings.T_hand_offset),
+                                             2, np.pi * 2, 20, np.pi * 80)
+                    left_builder.add_target("base", "link_left_arm_6", left_T @ np.linalg.inv(Settings.T_hand_offset),
+                                            2, np.pi * 2, 20, np.pi * 80)
+
+                    ctrl_builder = (
+                        rby.BodyComponentBasedCommandBuilder()
+                        .set_torso_command(torso_builder)
+                        .set_right_arm_command(right_builder)
+                        .set_left_arm_command(left_builder)
+                    )
+
+                torso_reset = False
+                right_reset = False
+                left_reset = False
+
+                stream.send_command(
+                    rby.RobotCommandBuilder().set_command(
+                        rby.ComponentBasedCommandBuilder()
+                        # .set_head_command(
+                        #     rby.JointPositionCommandBuilder()
+                        #     .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
+                        #     .set_position([float(yaw), float(pitch)])
+                        #     .set_minimum_time(Settings.dt * 1.01)
+                        # )
+                        .set_mobility_command(
+                            rby.SE2VelocityCommandBuilder()
+                            .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
+                            .set_velocity(-SystemContext.vr_state.mobile_linear_velocity,
+                                          -SystemContext.vr_state.mobile_angular_velocity)
+                            .set_minimum_time(Settings.dt * 1.01)
+                        )
+                        .set_body_command(
+                            ctrl_builder
+                        )
+                    )
+                )
+            except Exception as e:
+                logging.error(f"Stream error: {e}")
+                stream = None
+                exit(1)
+
+        # ...
+
+
+if __name__ == "__main__":
+    with open(_CONFIG_PATH, encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+        user_pc_ip = config['user_pc_ip']
+        metaquest_ip = config['metaquest_ip']
+        local_ip = config['local_ip']
+
+    parser = argparse.ArgumentParser(description="RB-Y1 VR Control Launcher")
+
+    parser.add_argument(
+        "-s", "--server", type=str, default="tcp://*:5555",
+        help="ZMQ server address for the UPC (default: tcp://*:5555)"
+    )
+    parser.add_argument(
+        "--local_ip", required=False, default=local_ip,type=str,
+        help="Local Wi-Fi (or LAN) IP address of the UPC"
+    )
+    parser.add_argument(
+        "--meta_quest_ip", required=False, default=metaquest_ip, type=str,
+        help=f"Wi-Fi (or LAN) IP address of the Meta Quest (default: {metaquest_ip})"
+    )
+    parser.add_argument(
+        "--no_gripper", action="store_true",
+        help="Run without gripper support"
+    )
+    parser.add_argument(
+        "--rby1", default=user_pc_ip, type=str,
+        help=f"RPC address of the RB-Y1 robot (default: {user_pc_ip})"
+    )
+    parser.add_argument(
+        "--rby1_model", default="a", type=str,
+        help="Model type of the RB-Y1 robot (default: a)"
+    )
+    parser.add_argument(
+        "--no_head", action="store_false", 
+        help="Run without controlling the head"
+    )
+    parser.add_argument(
+        "--whole_body", action="store_true",
+        help="Use a whole-body optimization formulation (single control for all joints)"
+    )
+    parser.add_argument(
+        "--data_collect", action="store_true",
+        help="Enable H5 Writer and saved demo (default: False)"
+    )
+    parser.add_argument(
+        "--no_data_collect", action="store_false", dest="data_collect",
+        help="Disable H5 Writer and saved demo (default: True)"
+    )
+
+    args = parser.parse_args()
+    
+    try:
+        main(args)
+    except KeyboardInterrupt:
+        logging.info("Received keyboard interrupt, shutting down...")
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
+        raise

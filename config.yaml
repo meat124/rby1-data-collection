@@ -1,0 +1,60 @@
+# ============================================================
+# Demo Collection
+# ============================================================
+# task_name: "PuttingCupintotheDishV2"
+task_name: "wipe_board"
+demo_root: "/media/hyunjin/T7/rby1_demo/"
+rec_fps: 15
+
+# ============================================================
+# Dataset Conversion
+# ============================================================
+conversion_task_name: "PuttingCupintotheDishV2"
+v2_dataset_saving_root: "/media/hyunjin/T7/rby1_demo/LeRobotDataset_v2"
+conversion_prompt: "pick up the cup and place it on the plate"
+user_name: "meat000124"
+
+# ============================================================
+# Network
+# ============================================================
+user_pc_ip: "192.168.0.50:50051"
+metaquest_ip: "192.168.0.39"
+local_ip: "192.168.0.27"
+
+remote_gripper_host: "192.168.0.56"
+remote_gripper_port: 5009
+remote_gripper_timeout: 30
+
+remote_master_arm_host: "192.168.0.56"
+remote_master_arm_state_port: 5010
+remote_master_arm_cmd_port: 5011
+
+# ============================================================
+# Robot
+# ============================================================
+elbow_angle_threshold_deg: 90
+
+# ============================================================
+# Cameras
+# RealSense serials: Head D435(922612070040), Right D435i(838212074317), Left D435i(838212070714)
+# ============================================================
+img_size:
+  width: 640
+  height: 480
+
+cameras:
+  head:
+    namespace: "camera"
+    serial: "922612070040"
+    color: "/camera/camera/color/image_raw"
+    depth: "/camera/camera/depth/image_rect_raw"
+  right:
+    namespace: "camera2"
+    serial: "838212074317"
+    color: "/camera2/camera/color/image_raw"
+    depth: "/camera2/camera/depth/image_rect_raw"
+  left:
+    namespace: "camera3"
+    serial: "838212070714"
+    color: "/camera3/camera/color/image_raw"
+    depth: "/camera3/camera/depth/image_rect_raw"
