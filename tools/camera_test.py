@@ -20,7 +20,7 @@ def main():
         print(f"    Product Line: {device.get_info(rs.camera_info.product_line)}")
 
     # Output directory
-    output_dir = "/home/hyunjin/RBY1_migration/rby1_ws/rby1-data-collection/tools/camera_output"
+    output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "camera_output")
     os.makedirs(output_dir, exist_ok=True)
     
     print(f"\nAttempting to capture one frame from each device into '{output_dir}'...")
