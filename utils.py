@@ -2,15 +2,35 @@ import numpy as np
 import os
 import yaml
 import logging
-import rby1_sdk as rby
-from typing import Union
-import cv2
-import h5py
+from typing import Any
 
 try:
     from sensor_msgs.msg import Image
 except ImportError:
     Image = None  # ROS not available; rosimg_to_numpy() will not be usable
+
+
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.yaml')
+
+
+def load_collection_config() -> dict[str, Any]:
+    with open(_CONFIG_PATH, encoding='utf-8') as f:
+        return yaml.safe_load(f) or {}
+
+
+def get_enabled_camera_configs(config: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+    config = load_collection_config() if config is None else config
+    cameras = config.get("cameras", {}) or {}
+    enabled_cameras = {}
+
+    for camera_name, spec in cameras.items():
+        if not isinstance(spec, dict):
+            logging.warning("Skipping invalid camera config for %s", camera_name)
+            continue
+        if bool(spec.get("enabled", True)):
+            enabled_cameras[camera_name] = spec
+
+    return enabled_cameras
 
 def rosimg_to_numpy(msg) -> np.ndarray:
     """Convert sensor_msgs/Image → np.ndarray (HxWxC, uint8)."""
@@ -44,7 +64,7 @@ def get_next_h5_path(base_dir="/home/nvidia/rby1_ws/rby1-data-collection/Demo"):
     return os.path.join(episode_dir, f"demo_{next_index}.h5")
 
 
-def elbows_bending_check(robot: rby.Robot_A) -> bool:
+def elbows_bending_check(robot: Any) -> bool:
     """
     Checks if elbow angles exceed a threshold to determine if a movement should be skipped.
 
@@ -115,6 +135,9 @@ def save_video(h5_path, output_filename="robot_video.avi", camera_name='head', f
     Note: camera.py가 rgb8 포맷으로 수집하므로 h5의 이미지는 RGB 순서입니다.
     기존 bgr8로 수집된 h5 파일에 대해서는 색상이 뒤바뀔 수 있습니다.
     """
+    import cv2
+    import h5py
+
     if not os.path.exists(h5_path):
         logging.warning(f"❌ 파일을 찾을 수 없습니다.")
         return
