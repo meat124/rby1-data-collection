@@ -71,6 +71,7 @@ def handle_vr_button_event(robot: Union[rby.Robot_A, rby.Robot_M], no_head: bool
     model = robot.model()
     torso_dof = len(model.torso_idx)
     head_dof = len(model.head_idx)
+    stream_reset_requested = False
 
     if SystemContext.vr_state.event_right_a_pressed:
         logging.info("Right A button pressed. Torso Mode initialized. Moving robot to ready pose.")
@@ -138,6 +139,7 @@ def handle_vr_button_event(robot: Union[rby.Robot_A, rby.Robot_M], no_head: bool
                 )
             ).get()
         torso_mode = True
+        stream_reset_requested = True
         SystemContext.vr_state.is_initialized = True
         SystemContext.vr_state.is_stopped = False
 
@@ -205,27 +207,20 @@ def handle_vr_button_event(robot: Union[rby.Robot_A, rby.Robot_M], no_head: bool
                 )
             ).get()
         torso_mode = False
+        stream_reset_requested = True
         SystemContext.vr_state.is_initialized = True
         SystemContext.vr_state.is_stopped = False
 
     elif SystemContext.vr_state.event_right_b_pressed:
         logging.info("Right B button pressed. Stopping and saving recording.")
-        # Atomically update recording status before stopping
-        with SystemContext.recording_lock:
-            SystemContext.demo_recording_status = "idle"
-
-            if SystemContext.rec_stop_event is not None:
-                SystemContext.rec_stop_event.set()
-                logging.info("Signaled demo logger to stop")
-
-        try:
-            if SystemContext.h5_writer is not None:
-                SystemContext.h5_writer.stop()
-                logging.info("H5 writer stopped and file saved")
-        except Exception as e:
-            logging.warning(f"Failed to stop H5 writer: {e}")    
-
-        SystemContext.vr_state.is_stopped = True
+        manager = getattr(SystemContext, "recording_manager", None)
+        if manager is not None:
+            if manager.request_stop_and_save():
+                logging.info("Stop/save requested through recording manager")
+            else:
+                logging.info("Stop/save ignored because no active recording is running")
+        else:
+            logging.warning("Recording manager is not initialized; ignoring stop/save request")
 
     elif SystemContext.vr_state.event_left_a_pressed:
         # Debounce: X 버튼 연타 방지 (0.5초 이상의 간격만 인정)
@@ -234,56 +229,16 @@ def handle_vr_button_event(robot: Union[rby.Robot_A, rby.Robot_M], no_head: bool
             logging.debug(f"X button debounced (interval: {current_time - last_x_button_time:.3f}s < {X_BUTTON_DEBOUNCE_TIME}s)")
         else:
             last_x_button_time = current_time
-            _stop_rec_event = False
-            _stop_h5_writer = False
-
-            with SystemContext.recording_lock:
-                logging.info(f"Left X button pressed. Current demo recording status: {SystemContext.demo_recording_status}")
-
-                if SystemContext.demo_recording_status == "idle":
-                    # First press: Start recording
-                    logging.info("Starting demo recording")
-                    SystemContext.demo_recording_status = "recording"
-                    SystemContext.start_new_recording_requested = True
-                    SystemContext.vr_state.is_initialized = True
-                    SystemContext.vr_state.is_stopped = False
-
-                elif SystemContext.demo_recording_status == "recording":
-                    # Second press: Stop recording
-                    logging.info("Stopping demo recording")
-                    SystemContext.demo_recording_status = "stopping"
-                    _stop_rec_event = True
-                    _stop_h5_writer = True
-                    SystemContext.vr_state.is_stopped = True
-
-                elif SystemContext.demo_recording_status == "stopping":
-                    # Third press: Start new recording
-                    logging.info("Starting new demo recording")
-                    SystemContext.demo_recording_status = "recording"
-                    SystemContext.start_new_recording_requested = True
-                    SystemContext.vr_state.is_initialized = True
-                    SystemContext.vr_state.is_stopped = False
-
-            # Perform blocking stop operations outside the lock to avoid deadlock
-            if _stop_rec_event:
-                try:
-                    if SystemContext.rec_stop_event is not None:
-                        SystemContext.rec_stop_event.set()
-                        logging.info("Signaled demo logger to stop")
-                except Exception as e:
-                    logging.warning(f"Failed to signal demo logger: {e}")
-
-            if _stop_h5_writer:
-                try:
-                    if SystemContext.h5_writer is not None:
-                        SystemContext.h5_writer.stop()
-                        logging.info("H5 writer stopped and file saved")
-                except Exception as e:
-                    logging.warning(f"Failed to stop H5 writer: {e}")
-
-                # Keep camera stream alive between recordings.
-                # This avoids repeated warm-up and reduces startup latency/color instability.
-                logging.info("Camera stream kept running for next recording session")
+            manager = getattr(SystemContext, "recording_manager", None)
+            if manager is not None:
+                status = manager.get_status_snapshot()["status"]
+                logging.info("Left X button pressed. Current recording status: %s", status)
+                if manager.request_toggle_recording():
+                    logging.info("Recording toggle accepted by recording manager")
+                else:
+                    logging.info("Recording toggle ignored in current state")
+            else:
+                logging.warning("Recording manager is not initialized; ignoring toggle request")
 
     else:
         return False, torso_mode
@@ -293,4 +248,4 @@ def handle_vr_button_event(robot: Union[rby.Robot_A, rby.Robot_M], no_head: bool
     SystemContext.vr_state.event_left_a_pressed = False
     SystemContext.vr_state.event_left_b_pressed = False
 
-    return True, torso_mode
+    return stream_reset_requested, torso_mode

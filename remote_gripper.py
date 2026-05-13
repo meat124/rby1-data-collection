@@ -171,6 +171,12 @@ class Gripper:
         if not resp or not resp.get("ok", False):
             raise RuntimeError("[Gripper] Failed to stop remote gripper loop (no response or ok=false)")
 
+    def close(self):
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
     def loop(self):
         pass
 

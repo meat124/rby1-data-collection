@@ -1,24 +1,34 @@
 import argparse
+import base64
+import importlib
 import logging
 import zmq
 import time
 import threading
-import rby1_sdk as rby
+from local_sdk_bootstrap import ensure_local_rby1_sdk_path
+
+ensure_local_rby1_sdk_path()
+
+try:
+    rby = importlib.import_module("rby1_sdk")
+except ModuleNotFoundError as exc:
+    raise ModuleNotFoundError(
+        "rby1_sdk is required to run the Meta Quest RBY1 backend. "
+        "Build or install the SDK bindings before starting main.py."
+    ) from exc
 import numpy as np
 from scipy.spatial.transform import Rotation as R, Slerp
 from remote_gripper import Gripper
 import pickle
-import yaml
 import os
 
-# demo writer
-from h5_writer import H5Writer
 from pcd_utils import rgbd_to_pointcloud, REALSENSE_D435_INTRINSICS, REALSENSE_D435_INTRINSICS_848x480
 
 from utils import *
 from helper import *
 
 from camera import MultiRealsense
+from recording_manager import RecordingManager
 from setup import Settings, SystemContext
 from robot_communicate import connect_rby1
 from vr_communicate import setup_meta_quest_udp_communication, handle_vr_button_event
@@ -42,6 +52,14 @@ def open_zmq_pub_socket(bind_address: str) -> zmq.Socket:
     logging.info(f"ZMQ PUB server opened at {bind_address}")
     return socket
 
+
+def open_zmq_rep_socket(bind_address: str) -> zmq.Socket:
+    context = zmq.Context()
+    socket = context.socket(zmq.REP)
+    socket.bind(bind_address)
+    logging.info(f"ZMQ REP server opened at {bind_address}")
+    return socket
+
 def pose_to_se3(position, rotation_quat):
     T = np.eye(4)
     T[:3, :3] = R.from_quat(rotation_quat).as_matrix()
@@ -49,7 +67,8 @@ def pose_to_se3(position, rotation_quat):
     return T
 
 
-def publish_gv(sock: zmq.Socket):
+def publish_gv(bind_address: str):
+    sock = open_zmq_pub_socket(bind_address)
     while True:
         try:
             sock.send(pickle.dumps(SystemContext.vr_state))
@@ -57,15 +76,276 @@ def publish_gv(sock: zmq.Socket):
             logging.warning(f"[publish_gv] Failed to publish state: {e}")
         time.sleep(0.1)
 
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.yaml')
+
+def load_cv2():
+    try:
+        return importlib.import_module("cv2")
+    except ModuleNotFoundError:
+        return None
+
+
+def encode_primary_preview_jpeg(max_width: int = 480, quality: int = 80) -> str | None:
+    realsense_obj = SystemContext.realsense
+    realsense = realsense_obj if isinstance(realsense_obj, MultiRealsense) else None
+    if realsense is None or not getattr(realsense, "running", False):
+        return None
+
+    frames = realsense.get_frames()
+    if not frames and hasattr(realsense, "get_latest_frames"):
+        frames = realsense.get_latest_frames()
+    if not frames:
+        return None
+
+    camera_context = build_camera_recording_context(Settings.rec_fps)
+    primary_serial = camera_context["primary_serial"]
+    if primary_serial is None or primary_serial not in frames:
+        return None
+
+    frame = frames[primary_serial]
+
+    rgb = getattr(frame, "color", None)
+    if rgb is None:
+        return None
+
+    try:
+        cv2 = load_cv2()
+        if cv2 is None:
+            return None
+
+        height, width = rgb.shape[:2]
+        if width > max_width:
+            scale = max_width / float(width)
+            rgb = cv2.resize(rgb, (int(width * scale), int(height * scale)))
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+            [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)],
+        )
+        if not ok:
+            return None
+        return base64.b64encode(encoded.tobytes()).decode("ascii")
+    except Exception as exc:
+        logging.warning("[dashboard] Failed to encode preview frame: %s", exc)
+        return None
+
+
+def queue_dashboard_initialization(command: str) -> bool:
+    if command == "init_torso_mode":
+        SystemContext.vr_state.event_right_a_pressed = True
+        return True
+    if command == "init_bimanual_mode":
+        SystemContext.vr_state.event_left_b_pressed = True
+        return True
+    return False
+
+
+def build_dashboard_snapshot(
+    recording_manager: RecordingManager,
+    *,
+    robot=None,
+    gripper=None,
+    include_preview: bool = False,
+) -> dict:
+    recording_manager.refresh_preflight(robot=robot, gripper=gripper)
+    snapshot = recording_manager.get_status_snapshot()
+    snapshot["ok"] = True
+    if include_preview:
+        snapshot["preview_jpeg_base64"] = encode_primary_preview_jpeg()
+    return snapshot
+
+
+def start_dashboard_command_server(bind_address: str, recording_manager: RecordingManager, *, robot=None, gripper=None):
+    def _serve():
+        socket = open_zmq_rep_socket(bind_address)
+        while True:
+            response = {"ok": False, "error": "uninitialized"}
+            try:
+                request = socket.recv_json()
+                if not isinstance(request, dict):
+                    raise ValueError("Dashboard request must be a JSON object")
+                command = request.get("command", "get_status")
+                if not isinstance(command, str):
+                    raise ValueError("Dashboard command must be a string")
+                include_preview = bool(request.get("include_preview", False))
+
+                if command == "get_status":
+                    response = build_dashboard_snapshot(
+                        recording_manager,
+                        robot=robot,
+                        gripper=gripper,
+                        include_preview=include_preview,
+                    )
+                elif command == "start_recording":
+                    recording_manager.refresh_preflight(robot=robot, gripper=gripper)
+                    accepted = recording_manager.request_start_recording()
+                    response = build_dashboard_snapshot(
+                        recording_manager,
+                        robot=robot,
+                        gripper=gripper,
+                        include_preview=True,
+                    )
+                    response.update({"ok": accepted, "accepted": accepted})
+                    if not accepted:
+                        response["error"] = response.get("message") or "Start request rejected"
+                elif command == "stop_recording":
+                    accepted = recording_manager.request_stop_and_save()
+                    response = build_dashboard_snapshot(
+                        recording_manager,
+                        robot=robot,
+                        gripper=gripper,
+                        include_preview=True,
+                    )
+                    response.update({"ok": accepted, "accepted": accepted})
+                    if not accepted:
+                        response["error"] = response.get("message") or "Stop request rejected"
+                elif command == "toggle_recording":
+                    recording_manager.refresh_preflight(robot=robot, gripper=gripper)
+                    accepted = recording_manager.request_toggle_recording()
+                    response = build_dashboard_snapshot(
+                        recording_manager,
+                        robot=robot,
+                        gripper=gripper,
+                        include_preview=True,
+                    )
+                    response.update({"ok": accepted, "accepted": accepted})
+                    if not accepted:
+                        response["error"] = response.get("message") or "Toggle request rejected"
+                elif command == "discard_last_demo":
+                    accepted = recording_manager.request_discard_last_demo()
+                    response = build_dashboard_snapshot(
+                        recording_manager,
+                        robot=robot,
+                        gripper=gripper,
+                        include_preview=True,
+                    )
+                    response.update({"ok": accepted, "accepted": accepted})
+                    if not accepted:
+                        response["error"] = response.get("message") or "Discard request rejected"
+                elif command == "init_torso_mode":
+                    accepted = queue_dashboard_initialization(command)
+                    response = build_dashboard_snapshot(
+                        recording_manager,
+                        robot=robot,
+                        gripper=gripper,
+                        include_preview=True,
+                    )
+                    response.update(
+                        {
+                            "ok": accepted,
+                            "accepted": accepted,
+                            "command_message": "Torso-mode ready pose requested. Robot motion can take several seconds.",
+                        }
+                    )
+                elif command == "init_bimanual_mode":
+                    accepted = queue_dashboard_initialization(command)
+                    response = build_dashboard_snapshot(
+                        recording_manager,
+                        robot=robot,
+                        gripper=gripper,
+                        include_preview=True,
+                    )
+                    response.update(
+                        {
+                            "ok": accepted,
+                            "accepted": accepted,
+                            "command_message": "Bimanual ready pose requested. Robot motion can take several seconds.",
+                        }
+                    )
+                elif command == "check_cameras":
+                    response = build_dashboard_snapshot(
+                        recording_manager,
+                        robot=robot,
+                        gripper=gripper,
+                        include_preview=True,
+                    )
+                    response.update(
+                        {
+                            "ok": True,
+                            "accepted": True,
+                            "command_message": "Camera diagnostics refreshed.",
+                        }
+                    )
+                else:
+                    response = {"ok": False, "error": f"Unknown command: {command}"}
+            except Exception as exc:
+                logging.exception("[dashboard] Command server error")
+                response = {"ok": False, "error": str(exc)}
+
+            try:
+                socket.send_json(response)
+            except Exception as exc:
+                logging.warning("[dashboard] Failed to send command response: %s", exc)
+
+    thread = threading.Thread(target=_serve, name="dashboard_command_server", daemon=True)
+    thread.start()
+    return thread
 
 def get_config():
-    with open(_CONFIG_PATH, encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-        return config
+    return load_collection_config()
+
+
+def build_camera_recording_context(fps: int) -> dict:
+    config = get_config()
+    all_cameras_config = config.get('cameras', {}) or {}
+    cameras_config = get_enabled_camera_configs(config)
+    if not all_cameras_config:
+        logging.warning("No camera configuration found in config.yaml. Camera streams will not be processed.")
+    elif not cameras_config:
+        logging.warning("All configured cameras are disabled in config.yaml. Camera streams will not be processed.")
+
+    cam_names = list(cameras_config.keys())
+    cam_name_to_serial = {cam_name: spec['serial'] for cam_name, spec in cameras_config.items()}
+    camera_serials = [cam_name_to_serial[cam_name] for cam_name in cam_names]
+    serial_to_cam_name = {v: k for k, v in cam_name_to_serial.items()}
+    primary_cam_name = "head" if "head" in cam_name_to_serial else (cam_names[0] if cam_names else None)
+
+    context = {
+        "cam_names": cam_names,
+        "cam_name_to_serial": cam_name_to_serial,
+        "camera_serials": camera_serials,
+        "serial_to_cam_name": serial_to_cam_name,
+        "expected_serials": set(camera_serials),
+        "primary_cam_name": primary_cam_name,
+        "primary_serial": cam_name_to_serial.get(primary_cam_name) if primary_cam_name else None,
+        "img_size": config.get('img_size', {'width': 640, 'height': 480}),
+        "camera_warmup_secs": float(config.get('camera_warmup_secs', 2.0)),
+        "camera_warmup_frames": int(config.get('camera_warmup_frames', max(15, int(fps)))),
+    }
+    SystemContext.camera_context = context
+    return context
+
+
+def ensure_realsense_started(camera_context: dict) -> MultiRealsense | None:
+    camera_serials = camera_context["camera_serials"]
+    if not camera_serials:
+        return None
+
+    realsense_obj = SystemContext.realsense
+    realsense = realsense_obj if isinstance(realsense_obj, MultiRealsense) else None
+    if realsense is not None and getattr(realsense, "running", False):
+        return realsense
+
+    img_size = camera_context["img_size"]
+    realsense = MultiRealsense(
+        camera_serials=camera_serials,
+        width=img_size['width'],
+        height=img_size['height'],
+    )
+    realsense.start()
+    SystemContext.realsense = realsense
+    SystemContext.camera_warmup_done = False
+    logging.info("Started RealSense streams (warm-up will run once).")
+    return realsense
 
 # NOTE
-def start_demo_logger(gripper: Gripper | None, h5_writer, robot, fps: int = 30) -> threading.Event:
+def start_demo_logger(
+    gripper: Gripper | None,
+    h5_writer,
+    robot,
+    *,
+    data_collection_enabled: bool,
+    fps: int = 30,
+) -> threading.Event:
     """
     Starts a daemon thread that prints a dict with:
       - robot_state.position
@@ -76,40 +356,17 @@ def start_demo_logger(gripper: Gripper | None, h5_writer, robot, fps: int = 30) 
     period = 1.0 / float(fps)
     stop_event = threading.Event()
 
-    # Get robot dynamics for IK computation
-    dyn_robot = robot.get_dynamics()
-    robot_model = robot.model()
+    camera_context = build_camera_recording_context(fps=fps)
+    cam_names = camera_context["cam_names"]
+    cam_name_to_serial = camera_context["cam_name_to_serial"]
+    serial_to_cam_name = camera_context["serial_to_cam_name"]
+    expected_serials = camera_context["expected_serials"]
+    primary_serial = camera_context["primary_serial"]
+    camera_warmup_secs = camera_context["camera_warmup_secs"]
+    camera_warmup_frames = camera_context["camera_warmup_frames"]
 
-    config = get_config()
-    # Get camera configuration from the config file
-    cameras_config = config.get('cameras', {})
-    if cameras_config is None:
-        cameras_config = {}
-    if not cameras_config:
-        logging.warning("No camera configuration found in config.yaml. Camera streams will not be processed.")
-    
-    cam_names = list(cameras_config.keys())
-    cam_name_to_serial = {cam_name: spec['serial'] for cam_name, spec in cameras_config.items()}
-    camera_serials = [cam_name_to_serial[cam_name] for cam_name in cam_names]
-    serial_to_cam_name = {v: k for k, v in cam_name_to_serial.items()}
-    expected_serials = set(camera_serials)
-    primary_serial = camera_serials[0] if camera_serials else None
-    img_size = config.get('img_size', {'width': 640, 'height': 480})
-    camera_warmup_secs = float(config.get('camera_warmup_secs', 2.0))
-    camera_warmup_frames = int(config.get('camera_warmup_frames', max(15, int(fps))))
-
-    realsense_obj = SystemContext.realsense
-    realsense = realsense_obj if isinstance(realsense_obj, MultiRealsense) else None
-    if realsense is None or not getattr(realsense, "running", False):
-        realsense = MultiRealsense(camera_serials=camera_serials, width=img_size['width'], height=img_size['height'])
-        realsense.start()
-
-        # Store realsense object in SystemContext for access from other threads
-        SystemContext.realsense = realsense
-        # Warm-up should run once per camera stream lifecycle.
-        SystemContext.camera_warmup_done = False
-        logging.info("Started RealSense streams (warm-up will run once).")
-    else:
+    realsense = ensure_realsense_started(camera_context)
+    if realsense is not None and getattr(realsense, "running", False):
         logging.info("Reusing existing RealSense streams (warm-up already done).")
 
     def _loop():
@@ -124,7 +381,7 @@ def start_demo_logger(gripper: Gripper | None, h5_writer, robot, fps: int = 30) 
 
         while not stop_event.is_set():
             # Thread-safe snapshot of latest camera frames (optional)
-            frames = realsense.get_frames()
+            frames = realsense.get_frames() if realsense is not None else {}
 
             if not frames:
                 frames = {}
@@ -151,7 +408,7 @@ def start_demo_logger(gripper: Gripper | None, h5_writer, robot, fps: int = 30) 
 
             # Strict synchronization rule for dataset recording:
             # record only when every configured camera exists and primary frame timestamp is fresh.
-            data_collection_bool = args.data_collect
+            data_collection_bool = data_collection_enabled
             if data_collection_bool and expected_serials:
                 missing_serials = expected_serials - set(frames.keys())
                 if missing_serials:
@@ -256,9 +513,32 @@ def start_demo_logger(gripper: Gripper | None, h5_writer, robot, fps: int = 30) 
 
             # Gripper encoders (actual measured state)
             grip = None
+            grip_target = None
+            ft_sensor_right_force = None
+            ft_sensor_right_torque = None
+            ft_sensor_left_force = None
+            ft_sensor_left_torque = None
             try:
+                with SystemContext.sensor_lock:
+                    if SystemContext.gripper_state is not None:
+                        grip = np.array(SystemContext.gripper_state, dtype=float)
+                    if SystemContext.gripper_target is not None:
+                        grip_target = np.array(SystemContext.gripper_target, dtype=float)
+                    ft_sensor_right_force = np.array(SystemContext.ft_sensor_right_force, dtype=float)
+                    ft_sensor_right_torque = np.array(SystemContext.ft_sensor_right_torque, dtype=float)
+                    ft_sensor_left_force = np.array(SystemContext.ft_sensor_left_force, dtype=float)
+                    ft_sensor_left_torque = np.array(SystemContext.ft_sensor_left_torque, dtype=float)
+
                 if gripper is not None and hasattr(gripper, "get_state"):
-                    grip = gripper.get_state()  # expected to return np.ndarray or None
+                    if grip is None:
+                        grip = gripper.get_state()  # expected to return np.ndarray or None
+                        if grip is not None:
+                            with SystemContext.sensor_lock:
+                                SystemContext.gripper_state = np.array(grip, dtype=float)
+                    if grip_target is None:
+                        grip_target = gripper.get_target().copy()
+                        with SystemContext.sensor_lock:
+                            SystemContext.gripper_target = np.array(grip_target, dtype=float)
             except Exception as e:
                 logging.warning(f"[demo_logger] Failed to read gripper state: {e}")
 
@@ -301,7 +581,9 @@ def start_demo_logger(gripper: Gripper | None, h5_writer, robot, fps: int = 30) 
                         # Resize RGB to match depth if needed
                         if rgb_frame.shape[:2] != depth_frame.shape:
                             try:
-                                import cv2
+                                cv2 = load_cv2()
+                                if cv2 is None:
+                                    raise ModuleNotFoundError("cv2")
                                 rgb_frame = cv2.resize(rgb_frame, (depth_frame.shape[1], depth_frame.shape[0]))
                             except ImportError:
                                 logging.warning("[demo_logger] cv2 not available for RGB resize")
@@ -343,8 +625,12 @@ def start_demo_logger(gripper: Gripper | None, h5_writer, robot, fps: int = 30) 
                     "robot_position": robot_pos,
                     "robot_target_joints": robot_target_joints,
                     "gripper_state": grip,
-                    "gripper_target": gripper.get_target().copy() if gripper else None,
+                    "gripper_target": grip_target,
                     "base_state" : base_state,
+                    "ft_sensor_right_force": ft_sensor_right_force,
+                    "ft_sensor_right_torque": ft_sensor_right_torque,
+                    "ft_sensor_left_force": ft_sensor_left_force,
+                    "ft_sensor_left_torque": ft_sensor_left_torque,
                     "pcd_points": pcd_points,
                     "pcd_colors": pcd_colors
                 }
@@ -400,23 +686,20 @@ def main(args: argparse.Namespace):
     logging.info(f"RB-Y1 Model          : {args.rby1_model}")
     logging.info(f"Use Head             : {'No' if args.no_head else 'Yes'}")
     logging.info(f"Data Collection      : {args.data_collect}")
+    logging.info(f"Dashboard Command API: {args.dashboard_cmd_server}")
 
     config = get_config() 
     root_path = os.path.join(config['demo_root'], config['task_name'])
     os.makedirs(root_path, exist_ok=True)
+    SystemContext.storage_root = root_path
 
-    # start writing
-    # H5 file will be created only when X button is pressed
-    output_path = None
-    h5_writer = None
+    recording_manager = None
     if args.data_collect:
         logging.info("Data collection mode enabled - H5 file will be created when X button is pressed")
 
     def power_off_and_stop():
-        if args.data_collect and rec_data is not None:
-            rec_data.set()  # stop signal for logging thread
-        if h5_writer is not None:
-            h5_writer.stop()  # save h5 file and exit
+        if recording_manager is not None:
+            recording_manager.shutdown()
         if isinstance(SystemContext.realsense, MultiRealsense):
             try:
                 SystemContext.realsense.stop()
@@ -427,7 +710,6 @@ def main(args: argparse.Namespace):
             cleanup_func()
 
 
-    socket = open_zmq_pub_socket(args.server)
     robot = connect_rby1(args.rby1, args.rby1_model, args.no_head)
     model = robot.model()
     setup_meta_quest_udp_communication(
@@ -439,6 +721,9 @@ def main(args: argparse.Namespace):
     )
 
     gripper = None
+    gripper_last_state_poll = 0.0
+    gripper_state_failures = 0
+    gripper_last_recovery = 0.0
     if not args.no_gripper:
         for arm in ["left", "right"]:
             if not robot.set_tool_flange_output_voltage(arm, 12):
@@ -450,31 +735,118 @@ def main(args: argparse.Namespace):
         gripper.homing()
         gripper.start()
         gripper.set_normalized_target(np.array([1.0, 1.0]))
+        with SystemContext.sensor_lock:
+            SystemContext.gripper_target = np.array([1.0, 1.0], dtype=float)
+        try:
+            initial_gripper_state = np.array(gripper.get_state(), dtype=float)
+        except Exception as exc:
+            initial_gripper_state = None
+            logging.warning("[gripper] Failed to read initial state: %s", exc)
+        if initial_gripper_state is not None:
+            with SystemContext.sensor_lock:
+                SystemContext.gripper_state = initial_gripper_state
 
-    pub_thread = threading.Thread(target=publish_gv, args=(socket,), daemon=True)
+    def refresh_gripper_feedback(force: bool = False):
+        nonlocal gripper
+        nonlocal gripper_last_state_poll
+        nonlocal gripper_state_failures
+        nonlocal gripper_last_recovery
+
+        if gripper is None:
+            return
+
+        now = time.monotonic()
+        if not force and (now - gripper_last_state_poll) < 0.2:
+            return
+        gripper_last_state_poll = now
+
+        try:
+            current_gripper_state = np.array(gripper.get_state(), dtype=float)
+            with SystemContext.sensor_lock:
+                SystemContext.gripper_state = current_gripper_state
+            gripper_state_failures = 0
+            return
+        except Exception as exc:
+            gripper_state_failures += 1
+            if gripper_state_failures == 1 or gripper_state_failures % 5 == 0:
+                logging.warning(
+                    "[gripper] Failed to refresh state (%d): %s",
+                    gripper_state_failures,
+                    exc,
+                )
+            if gripper_state_failures < 3 or (now - gripper_last_recovery) < 2.0:
+                return
+
+        gripper_last_recovery = now
+        with SystemContext.sensor_lock:
+            cached_target = (
+                np.array(SystemContext.gripper_target, dtype=float)
+                if SystemContext.gripper_target is not None
+                else None
+            )
+        if cached_target is None:
+            try:
+                cached_target = np.array(gripper.get_target(), dtype=float)
+            except Exception:
+                cached_target = np.array([1.0, 1.0], dtype=float)
+
+        old_gripper = gripper
+        try:
+            recovered_gripper = Gripper()
+            if not recovered_gripper.initialize(verbose=True):
+                raise RuntimeError("remote gripper ping failed during recovery")
+            recovered_gripper.start()
+            recovered_gripper.set_normalized_target(cached_target, wait_for_reply=False)
+            recovered_gripper_state = np.array(recovered_gripper.get_state(), dtype=float)
+
+            gripper = recovered_gripper
+            gripper_state_failures = 0
+            with SystemContext.sensor_lock:
+                SystemContext.gripper_target = np.array(cached_target, dtype=float)
+                SystemContext.gripper_state = recovered_gripper_state
+            logging.warning("[gripper] Reconnected remote gripper client after repeated state failures")
+        except Exception as recovery_exc:
+            logging.warning("[gripper] Recovery attempt failed: %s", recovery_exc)
+        finally:
+            if old_gripper is not gripper:
+                try:
+                    old_gripper.close()
+                except Exception:
+                    pass
+
+    pub_thread = threading.Thread(target=publish_gv, args=(args.server,), daemon=True)
     pub_thread.start()
-
-    rec_data = None
 
     # Initialize cleanup functions container before starting subsystems
     SystemContext.cleanup_functions = []
 
-    # Only start recording when X button is pressed, not at startup
     if args.data_collect:
-        logging.info("Data collection mode enabled - recording will start when X button is pressed")
-        SystemContext.demo_recording_status = "idle"
+        ensure_realsense_started(build_camera_recording_context(Settings.rec_fps))
+        recording_manager = RecordingManager(
+            root_path=root_path,
+            logger_factory=lambda gripper_handle, writer_handle, robot_handle: start_demo_logger(
+                gripper_handle,
+                writer_handle,
+                robot_handle,
+                data_collection_enabled=args.data_collect,
+                fps=Settings.rec_fps,
+            ),
+        )
+        SystemContext.recording_manager = recording_manager
+        recording_manager.refresh_preflight(robot=robot, gripper=gripper)
+        start_dashboard_command_server(
+            args.dashboard_cmd_server,
+            recording_manager,
+            robot=robot,
+            gripper=gripper,
+        )
+        logging.info("Data collection backend is ready and waiting for an explicit start request")
     else:
-        SystemContext.demo_recording_status = "idle"
-
-
-    # expose writer and stop-event so button handlers can stop and save
-    SystemContext.h5_writer = h5_writer
-    SystemContext.rec_stop_event = rec_data
-
-
-    logging.info(f"output path is {output_path}\n h5 is {h5_writer}\n")
+        SystemContext.recording_manager = None
 
     dyn_robot = robot.get_dynamics()
+    if SystemContext.robot_model is None:
+        raise RuntimeError("SystemContext.robot_model must be initialized before entering the control loop")
     dyn_state = dyn_robot.make_state(["base", "link_torso_5", "link_right_arm_6", "link_left_arm_6"],
                                      SystemContext.robot_model.robot_joint_names)
     base_link_idx, link_torso_5_idx, link_right_arm_6_idx, link_left_arm_6_idx = 0, 1, 2, 3
@@ -493,34 +865,18 @@ def main(args: argparse.Namespace):
             time.sleep(next_time - now)
         next_time += Settings.dt
 
+        if recording_manager is not None:
+            recording_manager.refresh_preflight(robot=robot, gripper=gripper)
+
+        refresh_gripper_feedback()
+
         if SystemContext.vr_state.joint_positions.size == 0:
             continue
-        button_event, torso_mode = handle_vr_button_event(robot, args.no_head)
-
-        # Handle new recording request (lock for thread-safe read-and-clear)
-        with SystemContext.recording_lock:
-            _new_recording = SystemContext.start_new_recording_requested
-            if _new_recording:
-                SystemContext.start_new_recording_requested = False
-
-        if _new_recording:
-            logging.info("Handling new recording request")
-
-            # Create new H5 file path and writer
-            output_path = get_next_h5_path(root_path)
-            h5_writer = H5Writer(path=output_path, flush_every=60, flush_secs=1.0).start()
-
-            # Start new demo logger
-            rec_data = start_demo_logger(gripper, h5_writer, robot, fps=Settings.rec_fps)
-
-            # Update SystemContext under lock so button handler sees consistent state
-            with SystemContext.recording_lock:
-                SystemContext.h5_writer = h5_writer
-                SystemContext.rec_stop_event = rec_data
-
-            logging.info(f"New recording started: {output_path}")
+        stream_reset_requested, torso_mode = handle_vr_button_event(robot, args.no_head)
+        if recording_manager is not None:
+            recording_manager.process_pending_actions(gripper=gripper, robot=robot)
         
-        if button_event:
+        if stream_reset_requested:
             if stream is not None:
                 stream.cancel()
                 stream = None
@@ -543,6 +899,8 @@ def main(args: argparse.Namespace):
                     gripper_target = gripper.get_target()
                     gripper_target[0] = 1. -right_controller["buttons"]["trigger"]
                     gripper.set_normalized_target(gripper_target)
+                    with SystemContext.sensor_lock:
+                        SystemContext.gripper_target = np.array(gripper_target, dtype=float)
 
             if "left" in SystemContext.vr_state.controller_state["hands"]:
                 left_controller = SystemContext.vr_state.controller_state["hands"]["left"]
@@ -550,6 +908,8 @@ def main(args: argparse.Namespace):
                     gripper_target = gripper.get_target()
                     gripper_target[1] = 1. - left_controller["buttons"]["trigger"]
                     gripper.set_normalized_target(gripper_target)
+                    with SystemContext.sensor_lock:
+                        SystemContext.gripper_target = np.array(gripper_target, dtype=float)
 
         # logging.info(f"{SystemContext.vr_state.center_of_mass = }")
 
@@ -806,11 +1166,10 @@ def main(args: argparse.Namespace):
 
 
 if __name__ == "__main__":
-    with open(_CONFIG_PATH, encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-        user_pc_ip = config['user_pc_ip']
-        metaquest_ip = config['metaquest_ip']
-        local_ip = config['local_ip']
+    config = get_config()
+    user_pc_ip = config['user_pc_ip']
+    metaquest_ip = config['metaquest_ip']
+    local_ip = config['local_ip']
 
     parser = argparse.ArgumentParser(description="RB-Y1 VR Control Launcher")
 
@@ -839,7 +1198,7 @@ if __name__ == "__main__":
         help="Model type of the RB-Y1 robot (default: a)"
     )
     parser.add_argument(
-        "--no_head", action="store_false", 
+        "--no_head", action="store_true",
         help="Run without controlling the head"
     )
     parser.add_argument(
@@ -853,6 +1212,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--no_data_collect", action="store_false", dest="data_collect",
         help="Disable H5 Writer and saved demo (default: True)"
+    )
+    parser.add_argument(
+        "--dashboard_cmd_server", type=str, default="tcp://127.0.0.1:5556",
+        help="Local ZMQ REP endpoint used by the notebook dashboard (default: tcp://127.0.0.1:5556)"
     )
 
     args = parser.parse_args()

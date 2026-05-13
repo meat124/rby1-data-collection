@@ -228,6 +228,7 @@ class GripperServer:
                 # wait_for_reply=True인 경우에도 아래 응답 반환
                 return {
                     "ok":     True,
+                    "cmd":    "set_normalized_target",
                     "target": g.target_q.tolist() if g.target_q is not None else None,
                 }
             except Exception as e:
