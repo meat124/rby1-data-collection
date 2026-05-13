@@ -1,10 +1,20 @@
 import logging
 import rby1_sdk as rby
+import numpy as np
 from setup import SystemContext, Settings
 
 def robot_state_callback(robot_state: rby.RobotState_A):
-    SystemContext.vr_state.joint_positions = robot_state.position # NOTE: where the current robot state is saved 
-    SystemContext.vr_state.center_of_mass = robot_state.center_of_mass
+    SystemContext.vr_state.joint_positions = np.asarray(robot_state.position, dtype=float)
+    SystemContext.vr_state.center_of_mass = np.asarray(robot_state.center_of_mass, dtype=float)
+
+    with SystemContext.sensor_lock:
+        try:
+            SystemContext.ft_sensor_right_force = np.asarray(robot_state.ft_sensor_right.force, dtype=float)
+            SystemContext.ft_sensor_right_torque = np.asarray(robot_state.ft_sensor_right.torque, dtype=float)
+            SystemContext.ft_sensor_left_force = np.asarray(robot_state.ft_sensor_left.force, dtype=float)
+            SystemContext.ft_sensor_left_torque = np.asarray(robot_state.ft_sensor_left.torque, dtype=float)
+        except Exception:
+            pass
 
 def connect_rby1(address: str, model: str = "a", no_head: bool = False):
     logging.info(f"Attempting to connect to RB-Y1... (Address: {address}, Model: {model})")

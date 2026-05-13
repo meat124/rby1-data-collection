@@ -62,13 +62,21 @@ class MultiRealsense:
         self.synced_frames: Dict[str, RGBDFrame] = {}
 
         # Discover available devices (temporary context — released before pipeline creation)
+        # Iterate per-device with error handling: some devices may fail UVC XU probing
+        # (set_xu / UVCIOC_CTRL_QUERY timeout) even when physically connected.
         _discovery_ctx = rs.context()
-        available_serials = {
-            dev.get_info(rs.camera_info.serial_number)
-            for dev in _discovery_ctx.query_devices()
-        }
-        del _discovery_ctx
-        gc.collect()
+        available_serials = set()
+        try:
+            _devs = _discovery_ctx.query_devices()
+            for _i in range(len(_devs)):
+                try:
+                    _dev = _devs[_i]
+                    available_serials.add(_dev.get_info(rs.camera_info.serial_number))
+                except Exception as _dev_e:
+                    logging.warning(f"장치 {_i} 탐색 중 오류 (건너뜀): {_dev_e}")
+        finally:
+            del _discovery_ctx
+            gc.collect()
         logging.info(f"연결된 RealSense 장치 ({len(available_serials)}개): {sorted(available_serials)}")
 
         # Per-camera pipeline creation (each pipeline gets its own internal context)
@@ -401,6 +409,44 @@ class MultiRealsense:
         """
         with self.lock:
             return dict(self.synced_frames)  # shallow dict copy — O(N cameras)
+
+    def get_latest_frames(self) -> Dict[str, RGBDFrame]:
+        """카메라별 최신 프레임을 반환합니다.
+
+        preview나 상태 진단처럼 "동기화가 완벽하지 않아도 최신 화면"이 필요한 경우에 사용합니다.
+        """
+        with self.lock:
+            return {
+                serial: buf[-1]
+                for serial, buf in self.buffers.items()
+                if len(buf) > 0
+            }
+
+    def get_camera_diagnostics(self) -> Dict[str, object]:
+        """현재 카메라 스트림 상태를 dashboard/preflight 용으로 요약합니다."""
+        with self.lock:
+            configured_serials = list(self.serials)
+            started_serials = list(self.buffers.keys())
+            latest_frame_serials = [serial for serial, buf in self.buffers.items() if len(buf) > 0]
+            synced_frame_serials = list(self.synced_frames.keys())
+
+        missing_started_serials = [serial for serial in configured_serials if serial not in started_serials]
+        missing_latest_serials = [serial for serial in configured_serials if serial not in latest_frame_serials]
+        missing_synced_serials = [serial for serial in configured_serials if serial not in synced_frame_serials]
+
+        return {
+            "running": self.running,
+            "configured_serials": configured_serials,
+            "started_serials": started_serials,
+            "latest_frame_serials": latest_frame_serials,
+            "synced_frame_serials": synced_frame_serials,
+            "missing_started_serials": missing_started_serials,
+            "missing_latest_serials": missing_latest_serials,
+            "missing_synced_serials": missing_synced_serials,
+            "all_started": not missing_started_serials and bool(configured_serials),
+            "all_have_latest": not missing_latest_serials and bool(configured_serials),
+            "all_have_synced": not missing_synced_serials and bool(configured_serials),
+        }
 
     def stop(self):
         self.running = False

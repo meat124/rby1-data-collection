@@ -7,7 +7,8 @@ import numpy as np
 import os
 from pathlib import Path
 import logging
-import yaml
+
+from utils import get_enabled_camera_configs, load_collection_config
 
 class H5Writer:
     def __init__(self, path: str, flush_every: int = 60, flush_secs: float = 1.0, save_pcd: bool = True):
@@ -67,10 +68,10 @@ class H5Writer:
           - ft_sensor_right_torque: np.ndarray[float] (3,) - right FT sensor torque [Nm]
           - ft_sensor_left_force: np.ndarray[float] (3,) - left FT sensor force [N]
           - ft_sensor_left_torque: np.ndarray[float] (3,) - left FT sensor torque [Nm]
-          - head_rgb: np.ndarray[uint8] shape (H, W, 3)
-          - head_rgb_ts: float  # optional; defaults to ts
-          - head_depth: np.ndarray[uint16] shape (H, W)
-          - head_depth_ts: float  # optional; defaults to ts
+                    - {camera_name}_rgb: np.ndarray[uint8] shape (H, W, 3) for each enabled camera in config.yaml
+                    - {camera_name}_rgb_ts: float  # optional; defaults to ts
+                    - {camera_name}_depth: np.ndarray[uint16] shape (H, W)
+                    - {camera_name}_depth_ts: float  # optional; defaults to ts
           - pcd_points: np.ndarray[float32] shape (N, 3) - point cloud XYZ coordinates
           - pcd_colors: np.ndarray[uint8] shape (N, 3) - point cloud RGB colors
         """
@@ -101,14 +102,9 @@ class H5Writer:
         # 현재까지 저장된 샘플 수를 추적 (업데이트 시 사용)
         saved_sample_count = 0
 
-        # camera datasets for all groups (head, right_wrist, left_wrist)
-
-        _config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.yaml')
-        with open(_config_path, encoding='utf-8') as f:
-            config = yaml.safe_load(f)
-        cams = config.get("cameras", {})
-        if cams is None:
-            cams = {}
+        # camera datasets for all enabled groups (for example: head, right_wrist)
+        config = load_collection_config()
+        cams = get_enabled_camera_configs(config)
         camera_groups = list(cams.keys())
         d_cam_data = {}  # {'head': {'time': dataset, 'img': dataset, 'idx': 0}, ...}
         for cam in camera_groups:
