@@ -2,16 +2,18 @@
 # Demo Collection
 # ============================================================
 # task_name: "PuttingCupintotheDishV2"
-task_name: "wipe_board"
-demo_root: "/media/hyunjin/T7/rby1_demo/"
+# task_name: "put_the_carrot_into_the_plate"
+task_name: "hang_the_mug"
+demo_root: "/media/hyunjin/T7/rby1_demo"
 rec_fps: 15
 
 # ============================================================
 # Dataset Conversion
 # ============================================================
-conversion_task_name: "PuttingCupintotheDishV2"
-v2_dataset_saving_root: "/media/hyunjin/T7/rby1_demo/LeRobotDataset_v2"
-conversion_prompt: "pick up the cup and place it on the plate"
+# conversion_task_name: "put_the_carrot_into_the_plate" # "PuttingCupintotheDishV2_100"
+conversion_task_name: "hang_the_mug" # "PuttingCupintotheDishV2_100"
+v2_dataset_saving_root: "/media/hyunjin/T7/rby1_demo/LeRobotDataset_v2" #"/media/hyunjin/T7/rby1_demo/LeRobotDataset_v2_100"
+conversion_prompt: "hang the mug" # "pick up the grey cup and place it on the plate"
 user_name: "meat000124"
 
 # ============================================================
@@ -36,7 +38,8 @@ elbow_angle_threshold_deg: 90
 
 # ============================================================
 # Cameras
-# RealSense serials: Head D435(922612070040), Right D435i(838212074317), Left D435i(838212070714)
+# ROS namespaces are currently mapped as: camera=left wrist, camera2=right wrist, camera3=head.
+# Use the logical camera names below in code and disable any stream with enabled: false.
 # ============================================================
 img_size:
   width: 640
@@ -44,17 +47,20 @@ img_size:
 
 cameras:
   head:
-    namespace: "camera"
-    serial: "922612070040"
-    color: "/camera/camera/color/image_raw"
-    depth: "/camera/camera/depth/image_rect_raw"
-  right:
-    namespace: "camera2"
-    serial: "838212074317"
-    color: "/camera2/camera/color/image_raw"
-    depth: "/camera2/camera/depth/image_rect_raw"
-  left:
+    enabled: true
     namespace: "camera3"
     serial: "838212070714"
     color: "/camera3/camera/color/image_raw"
     depth: "/camera3/camera/depth/image_rect_raw"
+  right_wrist:
+    enabled: true
+    namespace: "camera2"
+    serial: "838212074317"
+    color: "/camera2/camera/color/image_raw"
+    depth: "/camera2/camera/depth/image_rect_raw"
+  # left_wrist:
+  #   enabled: false
+  #   namespace: "camera"
+  #   serial: "922612070040"
+  #   color: "/camera/camera/color/image_raw"
+  #   depth: "/camera/camera/depth/image_rect_raw"
