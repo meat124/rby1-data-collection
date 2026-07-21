@@ -91,7 +91,7 @@ def handle_vr_button_event(robot: Union[rby.Robot_A, rby.Robot_M], no_head: bool
                     Settings.right_arm_midpoint1,
                     Settings.left_arm_midpoint1,
                     np.zeros(head_dof),
-                    minimum_time=7,
+                    minimum_time=3,
                 )
                 started = True
 
@@ -102,7 +102,7 @@ def handle_vr_button_event(robot: Union[rby.Robot_A, rby.Robot_M], no_head: bool
                     Settings.right_arm_midpoint2,
                     Settings.left_arm_midpoint2,
                     np.zeros(head_dof),
-                    minimum_time=7,
+                    minimum_time=3,
                 )
                 started = True
 
@@ -114,7 +114,7 @@ def handle_vr_button_event(robot: Union[rby.Robot_A, rby.Robot_M], no_head: bool
                     .set_position(Settings.body_init_pose)
                     .set_stiffness([400.] * 6 + [60] * 7 + [60] * 7)
                     .set_torque_limit([500] * 6 + [30] * 7 + [30] * 7)
-                    .set_minimum_time(2)
+                    .set_minimum_time(3)
                 )
             )
 
@@ -128,7 +128,7 @@ def handle_vr_button_event(robot: Union[rby.Robot_A, rby.Robot_M], no_head: bool
                         cbc.set_head_command(
                             rby.JointPositionCommandBuilder()
                             .set_position(np.deg2rad(Settings.torso_head_init_pose))
-                            .set_minimum_time(2)
+                            .set_minimum_time(3)
                         )
                 except Exception as e:
                     logging.warning(f"Failed to set head zero pose on init: {e}")
@@ -160,7 +160,7 @@ def handle_vr_button_event(robot: Union[rby.Robot_A, rby.Robot_M], no_head: bool
                     Settings.right_arm_midpoint1,
                     Settings.left_arm_midpoint1,
                     np.zeros(head_dof),
-                    minimum_time=7,
+                    minimum_time=3,
                 )
                 started = True
 
@@ -172,7 +172,7 @@ def handle_vr_button_event(robot: Union[rby.Robot_A, rby.Robot_M], no_head: bool
                     Settings.right_arm_midpoint2,
                     Settings.left_arm_midpoint2,
                     np.zeros(head_dof),
-                    minimum_time=7,
+                    minimum_time=3,
                 )
                 started = True
 
@@ -184,7 +184,7 @@ def handle_vr_button_event(robot: Union[rby.Robot_A, rby.Robot_M], no_head: bool
                     .set_position(Settings.body_init_pose)
                     .set_stiffness([400.] * 6 + [60] * 7 + [60] * 7)
                     .set_torque_limit([500] * 6 + [30] * 7 + [30] * 7)
-                    .set_minimum_time(2)
+                    .set_minimum_time(3)
                 )
             )
 
@@ -196,7 +196,7 @@ def handle_vr_button_event(robot: Union[rby.Robot_A, rby.Robot_M], no_head: bool
                         cbc.set_head_command(
                             rby.JointPositionCommandBuilder()
                             .set_position(np.deg2rad(Settings.bimanual_head_init_pose))
-                            .set_minimum_time(2)
+                            .set_minimum_time(3)
                         )
                 except Exception as e:
                     logging.warning(f"Failed to set head zero pose on init: {e}")
@@ -212,15 +212,19 @@ def handle_vr_button_event(robot: Union[rby.Robot_A, rby.Robot_M], no_head: bool
         SystemContext.vr_state.is_stopped = False
 
     elif SystemContext.vr_state.event_right_b_pressed:
-        logging.info("Right B button pressed. Stopping and saving recording.")
+        logging.info("Right B button pressed. Entering standby state.")
+        # In data-collection mode, stop & save any active recording first so no data is lost.
         manager = getattr(SystemContext, "recording_manager", None)
         if manager is not None:
             if manager.request_stop_and_save():
-                logging.info("Stop/save requested through recording manager")
+                logging.info("Stop/save requested through recording manager before standby")
             else:
-                logging.info("Stop/save ignored because no active recording is running")
-        else:
-            logging.warning("Recording manager is not initialized; ignoring stop/save request")
+                logging.info("No active recording to stop; entering standby only")
+        # Enter standby: the main control loop cancels the command stream, deactivates
+        # teleop (is_initialized -> False), and holds the robot in place.
+        # Press Right A again to re-initialize and resume teleop.
+        SystemContext.vr_state.is_stopped = True
+        stream_reset_requested = True
 
     elif SystemContext.vr_state.event_left_a_pressed:
         # Debounce: X 버튼 연타 방지 (0.5초 이상의 간격만 인정)

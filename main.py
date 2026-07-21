@@ -688,9 +688,10 @@ def main(args: argparse.Namespace):
     logging.info(f"Data Collection      : {args.data_collect}")
     logging.info(f"Dashboard Command API: {args.dashboard_cmd_server}")
 
-    config = get_config() 
+    config = get_config()
     root_path = os.path.join(config['demo_root'], config['task_name'])
-    os.makedirs(root_path, exist_ok=True)
+    if args.data_collect:
+        os.makedirs(root_path, exist_ok=True)
     SystemContext.storage_root = root_path
 
     recording_manager = None

@@ -13,7 +13,8 @@ rec_fps: 15
 # conversion_task_name: "put_the_carrot_into_the_plate" # "PuttingCupintotheDishV2_100"
 conversion_task_name: "hang_the_mug" # "PuttingCupintotheDishV2_100"
 v2_dataset_saving_root: "/media/hyunjin/T7/rby1_demo/LeRobotDataset_v2" #"/media/hyunjin/T7/rby1_demo/LeRobotDataset_v2_100"
-conversion_prompt: "hang the mug" # "pick up the grey cup and place it on the plate"
+# conversion_prompt: "put the carrot into the plate"
+conversion_prompt: "hang the mug" # "pick up the mug and hang it on the mug holder"
 user_name: "meat000124"
 
 # ============================================================
