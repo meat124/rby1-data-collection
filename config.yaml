@@ -24,6 +24,26 @@ user_pc_ip: "192.168.0.50:50051"
 metaquest_ip: "192.168.0.65"
 local_ip: "192.168.0.27"
 
+head_tracking:
+  stale_timeout_sec: 0.5
+  joint_limit_margin_deg: 1.0
+  max_velocity_deg_s: 90.0
+  max_acceleration_deg_s2: 180.0
+  yaw_scale: 1.0
+  pitch_scale: 1.0
+
+quest_video:
+  enabled: true
+  camera: "head"
+  bind_host: "0.0.0.0"
+  advertise_host: null
+  port: 8080
+  width: 640
+  height: 480
+  fps: 30
+  codec: "H264"
+  stale_frame_timeout_sec: 0.5
+
 remote_gripper_host: "192.168.0.56"
 remote_gripper_port: 5009
 remote_gripper_timeout: 30

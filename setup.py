@@ -31,6 +31,29 @@ class Settings:
 
     rec_fps: int = _config.get('rec_fps', 15)
 
+    head_tracking: dict[str, Any] = {
+        "stale_timeout_sec": 0.5,
+        "joint_limit_margin_deg": 1.0,
+        "max_velocity_deg_s": 90.0,
+        "max_acceleration_deg_s2": 180.0,
+        "yaw_scale": 1.0,
+        "pitch_scale": 1.0,
+        **(_config.get("head_tracking", {}) or {}),
+    }
+    quest_video: dict[str, Any] = {
+        "enabled": True,
+        "camera": "head",
+        "bind_host": "0.0.0.0",
+        "advertise_host": None,
+        "port": 8080,
+        "width": 640,
+        "height": 480,
+        "fps": 30,
+        "codec": "H264",
+        "stale_frame_timeout_sec": 0.5,
+        **(_config.get("quest_video", {}) or {}),
+    }
+
     MAX_POINT: int = None
 
     # Initial poses in degrees
@@ -96,6 +119,10 @@ class SystemContext:
     realsense: Optional[object] = None
     camera_warmup_done: bool = False
     camera_context: Optional[dict[str, Any]] = None
+    head_tracker: Optional[Any] = None
+    head_tracking_status: dict[str, Any] = {}
+    quest_video_server: Optional[Any] = None
+    quest_video_status: dict[str, Any] = {}
 
     recording_state: RecordingSessionState = RecordingSessionState()
     preflight_state: RecordingPreflightState = RecordingPreflightState()

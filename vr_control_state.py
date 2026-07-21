@@ -9,10 +9,12 @@ class VRControlState:
     joint_positions: np.ndarray = field(default_factory=lambda: np.array([]))
     center_of_mass: np.ndarray = field(default_factory=lambda: np.array([]))
     controller_state: dict = field(default_factory=dict)
+    controller_state_received_at: Optional[float] = None
 
     # Flags
     is_initialized: bool = False
     is_stopped: bool = False
+    head_recenter_requested: bool = True
 
     # Mobile base velocities
     mobile_linear_velocity: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0]))
@@ -30,6 +32,7 @@ class VRControlState:
     # Head controller
     head_controller_start_pose: np.ndarray = field(default_factory=lambda: np.identity(4))
     head_controller_current_pose: np.ndarray = field(default_factory=lambda: np.identity(4))
+    head_target_joints: np.ndarray = field(default_factory=lambda: np.array([]))
     torso_start_pose: np.ndarray = field(default_factory=lambda: np.identity(4))
     torso_current_pose: np.ndarray = field(default_factory=lambda: np.identity(4))
     torso_locked_pose: np.ndarray = field(default_factory=lambda: np.identity(4))

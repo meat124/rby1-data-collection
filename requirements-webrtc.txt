@@ -1,0 +1,4 @@
+# Optional dependencies for Meta Quest head-camera streaming.
+# The robot teleoperation path remains available when these are not installed.
+aiortc==1.15.0
+aiohttp==3.14.2

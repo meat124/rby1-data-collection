@@ -5,20 +5,26 @@ import socket
 from typing import Union
 import json
 import numpy as np
-import numpy as np
 import time
 from setup import SystemContext, Settings
 from helper import *
-import threading
 from utils import elbows_bending_check
 
 def setup_meta_quest_udp_communication(local_ip: str, local_port: int, meta_quest_ip: str, meta_quest_port: int,
-                                       power_off=None):
+                                       power_off=None, video_enabled: bool = True):
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         target_info = {
+            "protocol_version": 2,
             "ip": local_ip,
-            "port": local_port
+            "port": local_port,
         }
+        if video_enabled:
+            video_config = Settings.quest_video
+            signaling_host = video_config.get("advertise_host") or local_ip
+            target_info["video"] = {
+                "signaling_url": f"http://{signaling_host}:{video_config.get('port', 8080)}/offer",
+                "codec": video_config.get("codec", "H264"),
+            }
         message = json.dumps(target_info).encode('utf-8')
         sock.sendto(message, (meta_quest_ip, meta_quest_port))
         logging.info(f"Sent local PC info to Meta Quest: {target_info}")
@@ -31,9 +37,12 @@ def setup_meta_quest_udp_communication(local_ip: str, local_port: int, meta_ques
                 data, addr = server_sock.recvfrom(4096)
                 udp_msg = data.decode('utf-8')
                 try:
-                    SystemContext.vr_state.controller_state = json.loads(udp_msg)
-                    if "left" in SystemContext.vr_state.controller_state["hands"]:
-                        buttons = SystemContext.vr_state.controller_state["hands"]["left"]["buttons"]
+                    controller_state = json.loads(udp_msg)
+                    SystemContext.vr_state.controller_state = controller_state
+                    SystemContext.vr_state.controller_state_received_at = time.monotonic()
+                    hands = controller_state.get("hands", {})
+                    if "left" in hands:
+                        buttons = hands["left"]["buttons"]
                         primary_button = buttons["primaryButton"]
                         secondary_button = buttons["secondaryButton"]
 
@@ -47,22 +56,22 @@ def setup_meta_quest_udp_communication(local_ip: str, local_port: int, meta_ques
                         #         power_off()
                         #     pass
 
-                    if "right" in SystemContext.vr_state.controller_state["hands"]:
-                        buttons = SystemContext.vr_state.controller_state["hands"]["right"]["buttons"]
+                    if "right" in hands:
+                        buttons = hands["right"]["buttons"]
                         primary_button = buttons["primaryButton"]
                         secondary_button = buttons["secondaryButton"]
 
                         SystemContext.vr_state.event_right_a_pressed |= primary_button
                         SystemContext.vr_state.event_right_b_pressed |= secondary_button
 
-                except json.JSONDecodeError as e:
-                    logging.warning(f"Failed to decode JSON: {e} (from {addr}) - received data: {message[:100]}")
+                except (json.JSONDecodeError, KeyError, TypeError) as e:
+                    logging.warning(f"Failed to parse Meta Quest packet: {e} (from {addr}) - received data: {udp_msg[:100]}")
 
     thread = threading.Thread(target=udp_server, daemon=True)
     thread.start()
 
 started = False
-torso_mode = False  # 글로벌 상태로 변경
+torso_mode = False  # Return-shape compatibility; HMD-driven torso tracking is disabled.
 last_x_button_time = 0  # X 버튼 마지막 입력 시간 (debounce용)
 X_BUTTON_DEBOUNCE_TIME = 0.5  # 0.5초 이상의 간격만 인정
 
@@ -74,7 +83,7 @@ def handle_vr_button_event(robot: Union[rby.Robot_A, rby.Robot_M], no_head: bool
     stream_reset_requested = False
 
     if SystemContext.vr_state.event_right_a_pressed:
-        logging.info("Right A button pressed. Torso Mode initialized. Moving robot to ready pose.")
+        logging.info("Right A button pressed. Torso-locked ready mode initialized. Moving robot to ready pose.")
         if robot.get_control_manager_state().control_state != rby.ControlManagerState.ControlState.Idle:
             robot.cancel_control()
         if robot.wait_for_control_ready(1000):
@@ -138,10 +147,11 @@ def handle_vr_button_event(robot: Union[rby.Robot_A, rby.Robot_M], no_head: bool
                     cbc
                 )
             ).get()
-        torso_mode = True
+        torso_mode = False
         stream_reset_requested = True
         SystemContext.vr_state.is_initialized = True
         SystemContext.vr_state.is_stopped = False
+        SystemContext.vr_state.head_recenter_requested = True
 
     elif SystemContext.vr_state.event_left_b_pressed:
         logging.info("Left Y button pressed. Bimanual Mode initialized. Moving robot to ready pose.")
@@ -210,6 +220,7 @@ def handle_vr_button_event(robot: Union[rby.Robot_A, rby.Robot_M], no_head: bool
         stream_reset_requested = True
         SystemContext.vr_state.is_initialized = True
         SystemContext.vr_state.is_stopped = False
+        SystemContext.vr_state.head_recenter_requested = True
 
     elif SystemContext.vr_state.event_right_b_pressed:
         logging.info("Right B button pressed. Entering standby state.")

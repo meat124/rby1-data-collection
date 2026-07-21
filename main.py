@@ -28,6 +28,8 @@ from utils import *
 from helper import *
 
 from camera import MultiRealsense
+from head_tracking import HeadTracker, HeadTrackingConfig
+from quest_streaming import QuestVideoServer
 from recording_manager import RecordingManager
 from setup import Settings, SystemContext
 from robot_communicate import connect_rby1
@@ -148,6 +150,11 @@ def build_dashboard_snapshot(
 ) -> dict:
     recording_manager.refresh_preflight(robot=robot, gripper=gripper)
     snapshot = recording_manager.get_status_snapshot()
+    snapshot["head_tracking"] = dict(SystemContext.head_tracking_status)
+    video_server = SystemContext.quest_video_server
+    if video_server is not None:
+        SystemContext.quest_video_status = video_server.status_snapshot()
+    snapshot["quest_video"] = dict(SystemContext.quest_video_status)
     snapshot["ok"] = True
     if include_preview:
         snapshot["preview_jpeg_base64"] = encode_primary_preview_jpeg()
@@ -284,14 +291,22 @@ def get_config():
     return load_collection_config()
 
 
-def build_camera_recording_context(fps: int) -> dict:
+def build_camera_recording_context(fps: int, camera_names: set[str] | None = None) -> dict:
     config = get_config()
     all_cameras_config = config.get('cameras', {}) or {}
     cameras_config = get_enabled_camera_configs(config)
+    if camera_names is not None:
+        cameras_config = {
+            name: spec for name, spec in cameras_config.items()
+            if name in camera_names
+        }
     if not all_cameras_config:
         logging.warning("No camera configuration found in config.yaml. Camera streams will not be processed.")
     elif not cameras_config:
-        logging.warning("All configured cameras are disabled in config.yaml. Camera streams will not be processed.")
+        logging.warning(
+            "Requested cameras are not enabled in config.yaml: %s",
+            sorted(camera_names or []),
+        )
 
     cam_names = list(cameras_config.keys())
     cam_name_to_serial = {cam_name: spec['serial'] for cam_name, spec in cameras_config.items()}
@@ -308,6 +323,7 @@ def build_camera_recording_context(fps: int) -> dict:
         "primary_cam_name": primary_cam_name,
         "primary_serial": cam_name_to_serial.get(primary_cam_name) if primary_cam_name else None,
         "img_size": config.get('img_size', {'width': 640, 'height': 480}),
+        "capture_fps": max(int(fps), int(Settings.quest_video.get("fps", 30))),
         "camera_warmup_secs": float(config.get('camera_warmup_secs', 2.0)),
         "camera_warmup_frames": int(config.get('camera_warmup_frames', max(15, int(fps)))),
     }
@@ -330,6 +346,7 @@ def ensure_realsense_started(camera_context: dict) -> MultiRealsense | None:
         camera_serials=camera_serials,
         width=img_size['width'],
         height=img_size['height'],
+        fps=int(camera_context["capture_fps"]),
     )
     realsense.start()
     SystemContext.realsense = realsense
@@ -686,6 +703,7 @@ def main(args: argparse.Namespace):
     logging.info(f"RB-Y1 Model          : {args.rby1_model}")
     logging.info(f"Use Head             : {'No' if args.no_head else 'Yes'}")
     logging.info(f"Data Collection      : {args.data_collect}")
+    logging.info(f"Quest Head-Cam Video : {args.quest_video}")
     logging.info(f"Dashboard Command API: {args.dashboard_cmd_server}")
 
     config = get_config()
@@ -699,6 +717,9 @@ def main(args: argparse.Namespace):
         logging.info("Data collection mode enabled - H5 file will be created when X button is pressed")
 
     def power_off_and_stop():
+        video_server = SystemContext.quest_video_server
+        if video_server is not None:
+            video_server.stop()
         if recording_manager is not None:
             recording_manager.shutdown()
         if isinstance(SystemContext.realsense, MultiRealsense):
@@ -719,6 +740,7 @@ def main(args: argparse.Namespace):
         args.meta_quest_ip,
         Settings.vr_control_meta_quest_port, 
         power_off_and_stop,
+        video_enabled=args.quest_video,
     )
 
     gripper = None
@@ -821,8 +843,50 @@ def main(args: argparse.Namespace):
     # Initialize cleanup functions container before starting subsystems
     SystemContext.cleanup_functions = []
 
+    camera_context = None
+    realsense = None
+    if args.data_collect or args.quest_video:
+        requested_cameras = None
+        if args.quest_video and not args.data_collect:
+            requested_cameras = {str(Settings.quest_video.get("camera", "head"))}
+        camera_context = build_camera_recording_context(
+            Settings.rec_fps,
+            camera_names=requested_cameras,
+        )
+        realsense = ensure_realsense_started(camera_context)
+
+    if args.quest_video:
+        video_config = Settings.quest_video
+        camera_name = str(video_config.get("camera", "head"))
+        camera_serial = None
+        if camera_context is not None:
+            camera_serial = camera_context["cam_name_to_serial"].get(camera_name)
+        if camera_serial is None:
+            logging.error(
+                "[quest-video] Camera '%s' is not enabled in config.yaml; streaming black status frames",
+                camera_name,
+            )
+        quest_video_server = QuestVideoServer(
+            realsense=realsense,
+            camera_name=camera_name,
+            camera_serial=camera_serial,
+            bind_host=str(video_config.get("bind_host", "0.0.0.0")),
+            port=int(video_config.get("port", 8080)),
+            width=int(video_config.get("width", 640)),
+            height=int(video_config.get("height", 480)),
+            fps=int(video_config.get("fps", 30)),
+            codec=str(video_config.get("codec", "H264")),
+            stale_timeout_sec=float(video_config.get("stale_frame_timeout_sec", 0.5)),
+        )
+        SystemContext.quest_video_server = quest_video_server
+        quest_video_server.start()
+        SystemContext.quest_video_status = quest_video_server.status_snapshot()
+        SystemContext.cleanup_functions.append(quest_video_server.stop)
+    else:
+        SystemContext.quest_video_server = None
+        SystemContext.quest_video_status = {"enabled": False, "running": False}
+
     if args.data_collect:
-        ensure_realsense_started(build_camera_recording_context(Settings.rec_fps))
         recording_manager = RecordingManager(
             root_path=root_path,
             logger_factory=lambda gripper_handle, writer_handle, robot_handle: start_demo_logger(
@@ -852,6 +916,34 @@ def main(args: argparse.Namespace):
                                      SystemContext.robot_model.robot_joint_names)
     base_link_idx, link_torso_5_idx, link_right_arm_6_idx, link_left_arm_6_idx = 0, 1, 2, 3
 
+    head_tracker = None
+    head_indices = np.asarray(model.head_idx, dtype=int)
+    if not args.no_head:
+        if len(head_indices) != 2:
+            logging.warning("Head tracking disabled: expected 2 head joints, got %d", len(head_indices))
+        else:
+            head_config = Settings.head_tracking
+            lower_limits = dyn_robot.get_limit_q_lower(dyn_state)[head_indices]
+            upper_limits = dyn_robot.get_limit_q_upper(dyn_state)[head_indices]
+            head_tracker = HeadTracker(
+                lower_limits=lower_limits,
+                upper_limits=upper_limits,
+                config=HeadTrackingConfig(
+                    stale_timeout_sec=float(head_config["stale_timeout_sec"]),
+                    joint_limit_margin_rad=np.deg2rad(float(head_config["joint_limit_margin_deg"])),
+                    max_velocity_rad_s=np.deg2rad(float(head_config["max_velocity_deg_s"])),
+                    max_acceleration_rad_s2=np.deg2rad(float(head_config["max_acceleration_deg_s2"])),
+                    yaw_scale=float(head_config["yaw_scale"]),
+                    pitch_scale=float(head_config["pitch_scale"]),
+                ),
+            )
+            logging.info(
+                "HMD head tracking enabled with limits lower=%s upper=%s",
+                head_tracker.lower_limits,
+                head_tracker.upper_limits,
+            )
+    SystemContext.head_tracker = head_tracker
+
     next_time = time.monotonic()
     stream = None
     torso_reset = False
@@ -873,7 +965,7 @@ def main(args: argparse.Namespace):
 
         if SystemContext.vr_state.joint_positions.size == 0:
             continue
-        stream_reset_requested, torso_mode = handle_vr_button_event(robot, args.no_head)
+        stream_reset_requested, _torso_mode = handle_vr_button_event(robot, args.no_head)
         if recording_manager is not None:
             recording_manager.process_pending_actions(gripper=gripper, robot=robot)
         
@@ -925,26 +1017,20 @@ def main(args: argparse.Namespace):
         SystemContext.vr_state.left_ee_current_pose = dyn_robot.compute_transformation(dyn_state, base_link_idx,
                                                                                        link_left_arm_6_idx) @ Settings.T_hand_offset
 
-        trans_12 = dyn_robot.compute_transformation(dyn_state, 1, 2)
-        trans_13 = dyn_robot.compute_transformation(dyn_state, 1, 3)
-        center = (trans_12[:3, 3] + trans_13[:3, 3]) / 2
-        yaw = np.arctan2(center[1], center[0])
-        pitch = np.arctan2(-center[2], center[0]) - np.deg2rad(10)
-        yaw = np.clip(yaw, -np.deg2rad(29), np.deg2rad(29))
-        pitch = np.clip(pitch, -np.deg2rad(19), np.deg2rad(89))
-
         # Tracking
         if stream is None:
             if robot.wait_for_control_ready(0):
                 stream = robot.create_command_stream()
                 SystemContext.vr_state.mobile_linear_velocity = np.array([0.0, 0.0])
                 SystemContext.vr_state.mobile_angular_velocity = 0.
+                SystemContext.vr_state.is_torso_following = False
                 SystemContext.vr_state.is_right_following = False
                 SystemContext.vr_state.is_left_following = False
                 SystemContext.vr_state.base_start_pose = SystemContext.vr_state.base_pose
                 SystemContext.vr_state.torso_locked_pose = SystemContext.vr_state.torso_current_pose
                 SystemContext.vr_state.right_hand_locked_pose = SystemContext.vr_state.right_ee_current_pose
                 SystemContext.vr_state.left_hand_locked_pose = SystemContext.vr_state.left_ee_current_pose
+                torso_reset = True
 
         if "hands" in SystemContext.vr_state.controller_state:
             if "right" in SystemContext.vr_state.controller_state["hands"]:
@@ -991,22 +1077,29 @@ def main(args: argparse.Namespace):
             else:
                 SystemContext.vr_state.is_left_following = False
 
-            if "head" in SystemContext.vr_state.controller_state:
-                head_controller = SystemContext.vr_state.controller_state["head"]
-                SystemContext.vr_state.head_controller_current_pose = T_conv.T @ pose_to_se3(
-                    head_controller["position"],
-                    head_controller["rotation"]) @ T_conv
+        hmd_rotation = None
+        if "head" in SystemContext.vr_state.controller_state:
+            head_controller = SystemContext.vr_state.controller_state["head"]
+            SystemContext.vr_state.head_controller_current_pose = T_conv.T @ pose_to_se3(
+                head_controller["position"],
+                head_controller["rotation"]) @ T_conv
+            hmd_rotation = SystemContext.vr_state.head_controller_current_pose[:3, :3]
 
-                following = SystemContext.vr_state.is_right_following and SystemContext.vr_state.is_left_following and torso_mode
-                if SystemContext.vr_state.is_torso_following and not following:
-                    SystemContext.vr_state.is_torso_following = False
-                if not SystemContext.vr_state.is_torso_following and following:
-                    SystemContext.vr_state.head_controller_start_pose = SystemContext.vr_state.head_controller_current_pose
-                    SystemContext.vr_state.torso_start_pose = SystemContext.vr_state.torso_current_pose
-                    SystemContext.vr_state.is_torso_following = True
-                    torso_reset = True
-            else:
-                SystemContext.vr_state.is_torso_following = False
+        SystemContext.vr_state.is_torso_following = False
+        head_target = None
+        if head_tracker is not None:
+            if SystemContext.vr_state.head_recenter_requested:
+                head_tracker.request_recenter()
+                SystemContext.vr_state.head_recenter_requested = False
+            actual_head_joints = SystemContext.vr_state.joint_positions[head_indices]
+            head_target = head_tracker.update(
+                hmd_rotation=hmd_rotation,
+                actual_joints=actual_head_joints,
+                packet_received_at=SystemContext.vr_state.controller_state_received_at,
+                now=now,
+            )
+            SystemContext.vr_state.head_target_joints = head_target.copy()
+            SystemContext.head_tracking_status = head_tracker.status_snapshot(now)
 
         SystemContext.vr_state.mobile_linear_velocity -= Settings.mobile_linear_damping_gain * SystemContext.vr_state.mobile_linear_velocity
         SystemContext.vr_state.mobile_angular_velocity -= Settings.mobile_angular_damping_gain * SystemContext.vr_state.mobile_angular_velocity
@@ -1043,17 +1136,7 @@ def main(args: argparse.Namespace):
                 else:
                     left_T = SystemContext.vr_state.left_hand_locked_pose
 
-                if SystemContext.vr_state.is_torso_following and torso_mode:
-                    print('a')
-                    diff = np.linalg.inv(
-                        SystemContext.vr_state.head_controller_start_pose) @ SystemContext.vr_state.head_controller_current_pose
-
-                    T = np.identity(4)
-                    T[:3, :3] = SystemContext.vr_state.torso_start_pose[:3, :3]
-                    torso_T = SystemContext.vr_state.torso_start_pose @ diff
-                    SystemContext.vr_state.torso_locked_pose = torso_T
-                else:
-                    torso_T = SystemContext.vr_state.torso_locked_pose
+                torso_T = SystemContext.vr_state.torso_locked_pose
 
                 if args.whole_body:
                     ctrl_builder = (
@@ -1133,29 +1216,35 @@ def main(args: argparse.Namespace):
                         .set_left_arm_command(left_builder)
                     )
 
+                component_command = (
+                    rby.ComponentBasedCommandBuilder()
+                    .set_mobility_command(
+                        rby.SE2VelocityCommandBuilder()
+                        .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
+                        .set_velocity(-SystemContext.vr_state.mobile_linear_velocity,
+                                      -SystemContext.vr_state.mobile_angular_velocity)
+                        .set_minimum_time(Settings.dt * 1.01)
+                    )
+                    .set_body_command(ctrl_builder)
+                )
+                if head_tracker is not None and head_target is not None:
+                    head_command = (
+                        rby.JointPositionCommandBuilder()
+                        .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
+                        .set_position(head_target)
+                        .set_velocity_limit(np.full(2, head_tracker.config.max_velocity_rad_s))
+                        .set_acceleration_limit(np.full(2, head_tracker.config.max_acceleration_rad_s2))
+                        .set_minimum_time(Settings.dt * 1.01)
+                    )
+                    component_command.set_head_command(head_command)
+
                 torso_reset = False
                 right_reset = False
                 left_reset = False
 
                 stream.send_command(
                     rby.RobotCommandBuilder().set_command(
-                        rby.ComponentBasedCommandBuilder()
-                        # .set_head_command(
-                        #     rby.JointPositionCommandBuilder()
-                        #     .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
-                        #     .set_position([float(yaw), float(pitch)])
-                        #     .set_minimum_time(Settings.dt * 1.01)
-                        # )
-                        .set_mobility_command(
-                            rby.SE2VelocityCommandBuilder()
-                            .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(Settings.dt * 10))
-                            .set_velocity(-SystemContext.vr_state.mobile_linear_velocity,
-                                          -SystemContext.vr_state.mobile_angular_velocity)
-                            .set_minimum_time(Settings.dt * 1.01)
-                        )
-                        .set_body_command(
-                            ctrl_builder
-                        )
+                        component_command
                     )
                 )
             except Exception as e:
@@ -1214,6 +1303,16 @@ if __name__ == "__main__":
         "--no_data_collect", action="store_false", dest="data_collect",
         help="Disable H5 Writer and saved demo (default: True)"
     )
+    quest_video_group = parser.add_mutually_exclusive_group()
+    quest_video_group.add_argument(
+        "--quest_video", action="store_true", dest="quest_video",
+        help="Enable Meta Quest head-camera WebRTC streaming"
+    )
+    quest_video_group.add_argument(
+        "--no_quest_video", action="store_false", dest="quest_video",
+        help="Disable Meta Quest head-camera WebRTC streaming"
+    )
+    parser.set_defaults(quest_video=bool(Settings.quest_video.get("enabled", True)))
     parser.add_argument(
         "--dashboard_cmd_server", type=str, default="tcp://127.0.0.1:5556",
         help="Local ZMQ REP endpoint used by the notebook dashboard (default: tcp://127.0.0.1:5556)"
@@ -1228,3 +1327,20 @@ if __name__ == "__main__":
     except Exception as e:
         logging.error(f"Unexpected error: {e}")
         raise
+    finally:
+        manager = SystemContext.recording_manager
+        if manager is not None:
+            try:
+                manager.shutdown()
+            except Exception as exc:
+                logging.warning("Failed to shut down recording manager: %s", exc)
+        for cleanup_func in reversed(SystemContext.cleanup_functions):
+            try:
+                cleanup_func()
+            except Exception as exc:
+                logging.warning("Cleanup failed: %s", exc)
+        if isinstance(SystemContext.realsense, MultiRealsense):
+            try:
+                SystemContext.realsense.stop()
+            except Exception as exc:
+                logging.warning("Failed to stop camera during final cleanup: %s", exc)
